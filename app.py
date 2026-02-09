@@ -33,7 +33,7 @@ from kb.tokenize import tokenize
 
 # Keep source ASCII-stable: use unicode escapes for UI strings to avoid Windows encoding issues.
 S = {
-    "title": "\u77e5\u8bc6\u5e93\u5bf9\u8bdd (Little P)",
+    "title": "\u77e5\u8bc6\u5e93\u5bf9\u8bdd (\u03c0-zaya)",
     "settings": "\u8bbe\u7f6e",
     "db_path": "DB \u8def\u5f84",
     "top_k": "\u68c0\u7d22 Top-K",
@@ -2665,8 +2665,8 @@ def _page_chat(settings, chat_store: ChatStore, retriever: BM25Retriever, top_k:
         ctx = "\n\n---\n\n".join(ctx_parts)
 
         system = (
-            "你的名字是 Little P。\n"
-            "如果用户问‘你是谁/你叫什么/你是谁开发的’之类的问题，统一回答：我是 LittlePyx 开发的 Little P。\n"
+            "你的名字是 π-zaya（其中 π 是希腊字母 pi）。\n"
+            "如果用户问‘你是谁/你叫什么/你是谁开发的’之类的问题，统一回答：我是 P&I Lab 开发的 π-zaya（π 是希腊字母 pi）。\n"
             "你是我的个人知识库助手。优先基于我提供的检索片段回答问题。\n"
             "规则：\n"
             "1) 如果检索片段存在：优先基于片段回答；需要引用时，用 [1] [2] 这样的编号标注。\n"
