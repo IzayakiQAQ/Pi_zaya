@@ -18,6 +18,16 @@ def _format_context(hits: list[dict], max_chars: int = 12000) -> str:
         top = _top_heading(meta.get("heading_path", ""))
         if top:
             header += f" | section: {top}"
+        p0 = meta.get("page_start", None)
+        p1 = meta.get("page_end", None)
+        try:
+            if p0 is not None:
+                if p1 is not None and int(p1) != int(p0):
+                    header += f" | pages: {int(p0)}-{int(p1)}"
+                else:
+                    header += f" | page: {int(p0)}"
+        except Exception:
+            pass
         body = h.get("text", "")
         chunk = header + "\n" + body
         if used + len(chunk) > max_chars:

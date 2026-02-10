@@ -3458,9 +3458,15 @@ INPUT JSON:
                 cls_out = temp_dir / f"p{pnum:03d}.cls.json"
 
                 if self.cfg.skip_existing and en_out.exists() and (not self.cfg.translate_zh or zh_out.exists()):
-                    en_pages.append(en_out.read_text(encoding="utf-8", errors="replace"))
+                    en_md0 = en_out.read_text(encoding="utf-8", errors="replace")
+                    if "<!-- kb_page:" not in en_md0[:120]:
+                        en_md0 = f"<!-- kb_page: {pnum} -->\n\n" + en_md0.lstrip()
+                    en_pages.append(en_md0)
                     if self.cfg.translate_zh:
-                        zh_pages.append(zh_out.read_text(encoding="utf-8", errors="replace"))
+                        zh_md0 = zh_out.read_text(encoding="utf-8", errors="replace")
+                        if "<!-- kb_page:" not in zh_md0[:120]:
+                            zh_md0 = f"<!-- kb_page: {pnum} -->\n\n" + zh_md0.lstrip()
+                        zh_pages.append(zh_md0)
                     continue
 
                 page = doc[page_index]
@@ -3704,13 +3710,14 @@ INPUT JSON:
                 if self.cfg.keep_debug:
                     en_out.write_text(en_md, encoding="utf-8")
 
-                en_pages.append(en_md)
+                # Add a lightweight page marker so the KB can "定位到具体页" later.
+                en_pages.append(f"<!-- kb_page: {pnum} -->\n\n" + en_md.lstrip())
 
                 if self.cfg.translate_zh:
                     zh_md = self._call_llm_translate_zh(en_md)
                     if self.cfg.keep_debug:
                         zh_out.write_text(zh_md, encoding="utf-8")
-                    zh_pages.append(zh_md)
+                    zh_pages.append(f"<!-- kb_page: {pnum} -->\n\n" + zh_md.lstrip())
 
             en_full = postprocess_markdown("\n\n".join(en_pages))
             # Prefer PDF-layout-based REFERENCES extraction (more reliable for two-column + cross-page refs).

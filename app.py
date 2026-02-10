@@ -1800,6 +1800,43 @@ def _open_pdf(pdf_path: Path) -> tuple[bool, str]:
         return False, f"打开失败：{e}"
 
 
+def _file_url_for_pdf(path: Path, *, page: int | None = None) -> str:
+    """
+    Build a file:// URL for a local PDF, optionally with a #page=N fragment.
+    Many PDF viewers (and browsers) support opening at a specific page.
+    """
+    from urllib.parse import quote
+
+    p = Path(path).resolve()
+    # Windows path -> file:///C:/... form
+    s = p.as_posix()
+    if re.match(r"^[A-Za-z]:/", s):
+        url = "file:///" + quote(s)
+    else:
+        url = "file://" + quote(s)
+    if page and int(page) > 0:
+        url += f"#page={int(page)}"
+    return url
+
+
+def _open_pdf_at(pdf_path: Path, *, page: int | None = None) -> tuple[bool, str]:
+    """
+    Best-effort open a PDF and jump to a specific page.
+    Falls back to opening the file if the viewer doesn't support fragments.
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        return False, f"PDF 不存在：{pdf_path}"
+    if page and int(page) > 0:
+        url = _file_url_for_pdf(pdf_path, page=int(page))
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
+            return True, f"已打开：{pdf_path}（第 {int(page)} 页）"
+        except Exception:
+            pass
+    return _open_pdf(pdf_path)
+
+
 def _render_refs(
     hits: list[dict],
     *,
@@ -2120,9 +2157,28 @@ def _render_refs(
         src, main, what, _src_name = _brief_ref_line(i, h, prompt)
         meta_h = h.get("meta", {}) or {}
         pdf_path = _find_pdf_for_source(src)
+        # Optional page range (from converter markers -> chunking -> retriever).
+        p0 = meta_h.get("page_start", None)
+        p1 = meta_h.get("page_end", None)
+        page_label = ""
+        try:
+            if p0 is not None:
+                if p1 is not None and int(p1) != int(p0):
+                    page_label = f"p.{int(p0)}-{int(p1)}"
+                else:
+                    page_label = f"p.{int(p0)}"
+        except Exception:
+            page_label = ""
+
         cols = st.columns([12, 1.6])
         with cols[0]:
-            st.markdown(f"<div class='refbox'>- [{i}] {html.escape(main)}（{html.escape(what)}）</div>", unsafe_allow_html=True)
+            if page_label:
+                st.markdown(
+                    f"<div class='refbox'>- [{i}] {html.escape(main)} <code>{html.escape(page_label)}</code>（{html.escape(what)}）</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(f"<div class='refbox'>- [{i}] {html.escape(main)}（{html.escape(what)}）</div>", unsafe_allow_html=True)
             # Optional: show plain-text snippets (no markdown layout) for precise location.
             try:
                 if bool(st.session_state.get("show_context")):
@@ -2148,7 +2204,7 @@ def _render_refs(
             if pdf_path and pdf_path.exists():
                 k = hashlib.md5((src + "|" + str(pdf_path)).encode("utf-8", "ignore")).hexdigest()[:10]
                 if st.button("打开PDF", key=f"{key_ns}_openpdf_{i}_{k}", help=str(pdf_path)):
-                    ok, msg = _open_pdf(pdf_path)
+                    ok, msg = _open_pdf_at(pdf_path, page=int(p0) if (p0 is not None) else None)
                     (st.caption if ok else st.warning)(msg)
 
     for i, h in enumerate(head, start=1):
