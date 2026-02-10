@@ -3127,7 +3127,31 @@ def _page_chat(settings, chat_store: ChatStore, retriever: BM25Retriever, top_k:
 def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: Path, prefs: dict, retriever_reload_flag: dict) -> None:
     _bg_ensure_started()
 
-    default_pdf_dir = Path(os.environ.get("KB_PDF_DIR", r"F:\\research-papers")).expanduser().resolve()
+    def _guess_default_pdf_dir() -> Path:
+        env = (os.environ.get("KB_PDF_DIR") or "").strip().strip("'\"")
+        if env:
+            try:
+                return Path(env).expanduser().resolve()
+            except Exception:
+                return Path(env).expanduser()
+
+        # Prefer common locations if they exist; otherwise use a dedicated folder under home.
+        home = Path.home()
+        candidates = [
+            home / "research-papers",
+            home / "ResearchPapers",
+            home / "Papers",
+            home / "Downloads",
+        ]
+        for c in candidates:
+            try:
+                if c.exists():
+                    return c.resolve()
+            except Exception:
+                continue
+        return home / "Pi_zaya_pdfs"
+
+    default_pdf_dir = _guess_default_pdf_dir()
     default_md_dir = Path(os.environ.get("KB_MD_DIR", str(db_dir))).expanduser().resolve()
 
     pdf_default = st.session_state.get("pdf_dir") or prefs.get("pdf_dir") or str(default_pdf_dir)
@@ -3985,7 +4009,18 @@ def main() -> None:
     # Provide a default pdf_dir even if the user never opened the "文献管理" page
     # (refs can then still open PDFs).
     if ("pdf_dir" not in st.session_state) or (not str(st.session_state.get("pdf_dir") or "").strip()):
-        default_pdf_dir = Path(os.environ.get("KB_PDF_DIR", r"F:\\research-papers")).expanduser().resolve()
+        env_pdf = (os.environ.get("KB_PDF_DIR") or "").strip().strip("'\"")
+        if env_pdf:
+            try:
+                default_pdf_dir = Path(env_pdf).expanduser().resolve()
+            except Exception:
+                default_pdf_dir = Path(env_pdf).expanduser()
+        else:
+            home = Path.home()
+            try:
+                default_pdf_dir = (home / "research-papers").resolve() if (home / "research-papers").exists() else (home / "Pi_zaya_pdfs")
+            except Exception:
+                default_pdf_dir = home / "Pi_zaya_pdfs"
         pdf_dir_pref = (prefs.get("pdf_dir") or "").strip()
         try:
             st.session_state["pdf_dir"] = str(Path(pdf_dir_pref).expanduser().resolve()) if pdf_dir_pref else str(default_pdf_dir)

@@ -59,6 +59,12 @@ $env:DEEPSEEK_MODEL="deepseek-chat"
 - `PDF 路径`：你存放 PDF 的根目录
 - `DB 路径 / MD 路径`：你自己的知识库 Markdown 目录（或你建库时使用的 db 目录）
 
+（可选）你也可以用环境变量直接指定默认 PDF 目录（不改 UI 也能生效）：
+
+```powershell
+$env:KB_PDF_DIR="D:\\papers"
+```
+
 这些设置只会写在你电脑本地的 `user_prefs.json`，不会影响我，也不会被更新覆盖。
 
 ---
