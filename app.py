@@ -1867,6 +1867,11 @@ def _render_refs(
     key_ns: str = "refs",
     settings=None,
 ) -> None:
+    # Keep UI state per prompt, otherwise clicking "更多" can affect other prompts/reruns.
+    p_sig = hashlib.sha1((prompt or "").strip().encode("utf-8", "ignore")).hexdigest()[:8] if (prompt or "").strip() else "noprompt"
+    more_key = f"{key_ns}_more_{p_sig}"
+    open_key = f"{key_ns}_refs_open_{p_sig}"
+
     def _parse_paper_name(source_path: str) -> tuple[str, str, str]:
         """
         Try to parse 'venue-year-title' from the markdown filename.
@@ -2234,20 +2239,21 @@ def _render_refs(
 
     if tail:
         # Avoid nested expanders; also avoid showing an extra "展开更多..." line after expanded.
-        flag_key = f"{key_ns}_more"
-        if flag_key not in st.session_state:
-            st.session_state[flag_key] = False
+        if more_key not in st.session_state:
+            st.session_state[more_key] = False
 
-        if not st.session_state.get(flag_key):
+        if not st.session_state.get(more_key):
             c_more = st.columns([1, 14])
             with c_more[0]:
-                if st.button("…", key=f"{flag_key}_btn", help="显示更多参考定位"):
-                    st.session_state[flag_key] = True
+                if st.button("…", key=f"{more_key}_btn", help="显示更多参考定位"):
+                    # Keep the expander open after rerun, otherwise it looks like refs "disappeared".
+                    st.session_state[more_key] = True
+                    st.session_state[open_key] = True
                     st.experimental_rerun()
             with c_more[1]:
                 st.caption(f"共 {len(hits)} 条")
 
-        if st.session_state.get(flag_key):
+        if st.session_state.get(more_key):
             for j, h in enumerate(tail, start=4):
                 _render_one(j, h)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -2431,7 +2437,11 @@ def _render_refs_panel(prompt: str | None, retriever: BM25Retriever, top_k: int,
     """
 
     prompt = (prompt or "").strip()
-    with st.expander(S["refs"], expanded=False):
+    p_sig = hashlib.sha1(prompt.encode("utf-8", "ignore")).hexdigest()[:8] if prompt else "noprompt"
+    open_key = f"{key_ns}_refs_open_{p_sig}"
+    more_key = f"{key_ns}_more_{p_sig}"
+    expanded = bool(st.session_state.get(open_key)) or bool(st.session_state.get(more_key))
+    with st.expander(S["refs"], expanded=expanded):
         if not prompt:
             st.caption("（暂无可定位的问题）")
             return
@@ -2810,7 +2820,11 @@ def _page_chat(settings, chat_store: ChatStore, retriever: BM25Retriever, top_k:
                     "used_translation": bool(used_translation),
                 }
 
-                with st.expander(S["refs"], expanded=False):
+                p_sig2 = hashlib.sha1(prompt_to_answer.encode("utf-8", "ignore")).hexdigest()[:8] if prompt_to_answer else "noprompt"
+                open_key2 = f"{refs_key_ns}_refs_open_{p_sig2}"
+                more_key2 = f"{refs_key_ns}_more_{p_sig2}"
+                expanded2 = bool(st.session_state.get(open_key2)) or bool(st.session_state.get(more_key2))
+                with st.expander(S["refs"], expanded=expanded2):
                     if bool(st.session_state.get("debug_rank")) and used_query:
                         st.caption(f"rank debug: query={used_query}")
                     _render_refs(grouped_docs, prompt=prompt_to_answer, show_heading=False, key_ns=refs_key_ns, settings=settings)
