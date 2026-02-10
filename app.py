@@ -4053,9 +4053,17 @@ def _page_chat(
         """
 <script>
 (function () {
-  const root = window.parent.document;
+  const host = window.parent || window;
+  const root = host.document;
+  const LEFT_GUARD = 0;
+  function findMainRegion() {
+    return root.querySelector('section.main');
+  }
   function findMainContainer() {
     return root.querySelector('section.main .block-container') || root.querySelector('.block-container');
+  }
+  function findSidebar() {
+    return root.querySelector('section[data-testid="stSidebar"]');
   }
   function isSendBtnText(t) {
     return t === '发送' || t === '↑' || t === '■';
@@ -4083,8 +4091,11 @@ def _page_chat(
   }
   function placeDock(form) {
     if (!form) return;
-    const main = findMainContainer();
-    if (!main) {
+    // Keep composer width aligned with output content width.
+    const mainContainer = findMainContainer();
+    const mainRegion = findMainRegion();
+    const anchor = mainContainer || mainRegion;
+    if (!anchor) {
       form.classList.remove('kb-dock-positioned');
       form.style.left = '';
       form.style.right = '';
@@ -4092,13 +4103,35 @@ def _page_chat(
       form.style.transform = '';
       return;
     }
-    const rect = main.getBoundingClientRect();
+    const rect = anchor.getBoundingClientRect();
     if (!rect || !isFinite(rect.left) || !isFinite(rect.width) || rect.width < 10) return;
+    const dockLeft = Math.max(LEFT_GUARD, Math.floor(rect.left));
+    const dockWidth = Math.max(320, Math.floor(rect.width));
     form.classList.add('kb-dock-positioned');
-    form.style.left = Math.max(8, Math.floor(rect.left)) + 'px';
+    form.style.left = dockLeft + 'px';
     form.style.right = 'auto';
-    form.style.width = Math.max(320, Math.floor(rect.width)) + 'px';
+    form.style.width = dockWidth + 'px';
     form.style.transform = 'none';
+  }
+  function scheduleHook() {
+    if (host._kbDockRaf) return;
+    host._kbDockRaf = host.requestAnimationFrame(function () {
+      host._kbDockRaf = 0;
+      hook();
+    });
+  }
+  function installResizeObservers() {
+    if (host._kbDockObsInstalled === "1") return;
+    if (typeof ResizeObserver === "undefined") return;
+    try {
+      const obs = new ResizeObserver(function () { scheduleHook(); });
+      const targets = [findMainContainer(), findMainRegion(), findSidebar()];
+      for (const t of targets) {
+        if (t) obs.observe(t);
+      }
+      host._kbDockResizeObserver = obs;
+      host._kbDockObsInstalled = "1";
+    } catch (e) {}
   }
   function hook() {
     const hit = findPromptFormAndTextarea();
@@ -4126,9 +4159,11 @@ def _page_chat(
     }, { capture: true });
   }
   hook();
+  installResizeObservers();
   if (!root.body.dataset.kbDockHookTimer) {
     root.body.dataset.kbDockHookTimer = "1";
-    setInterval(hook, 800);
+    setInterval(hook, 360);
+    host.addEventListener('resize', scheduleHook, { passive: true });
   }
 })();
 </script>
@@ -5257,7 +5292,16 @@ def main() -> None:
 
         if st.button(S["del_chat"], key="delete_chat") and st.session_state.get("conv_id"):
             chat_store.delete_conversation(st.session_state["conv_id"])
-            st.session_state["conv_id"] = chat_store.create_conversation()
+            remaining = chat_store.list_conversations(limit=1)
+            if remaining:
+                st.session_state["conv_id"] = remaining[0]["id"]
+            else:
+                st.session_state["conv_id"] = chat_store.create_conversation()
+
+            if "conv_select" in st.session_state:
+                del st.session_state["conv_select"]
+
+            st.experimental_rerun()
 
     # Retriever (auto-reload when DB changes)
     docs_json = db_dir / "docs.json"
