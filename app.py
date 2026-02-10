@@ -33,6 +33,12 @@ from kb.retriever import BM25Retriever
 from kb.store import load_all_chunks
 from kb.tokenize import tokenize
 
+# Backward-compat for old runtime_state modules in long-lived Streamlit processes.
+if not hasattr(RUNTIME, "GEN_LOCK"):
+    RUNTIME.GEN_LOCK = threading.Lock()
+if not hasattr(RUNTIME, "GEN_TASKS"):
+    RUNTIME.GEN_TASKS = {}
+
 
 # Keep source ASCII-stable: use unicode escapes for UI strings to avoid Windows encoding issues.
 S = {
@@ -95,12 +101,10 @@ S = {
 
 
 
-# Background conversion queue and QA queue state are kept in an imported module.
+# Background conversion queue state is kept in an imported module.
 # This survives Streamlit reruns more reliably than script-level globals.
 _BG_LOCK = RUNTIME.BG_LOCK
 _BG_STATE = RUNTIME.BG_STATE
-_QA_LOCK = RUNTIME.QA_LOCK
-_QA_STATE = RUNTIME.QA_STATE
 _CACHE_LOCK = RUNTIME.CACHE_LOCK
 _CACHE = RUNTIME.CACHE
 
@@ -125,461 +129,383 @@ def _cache_set(bucket: str, key: str, val, *, max_items: int = 600) -> None:
                 d.clear()
 
 
-def _qa_enqueue(task: dict) -> None:
-    with _QA_LOCK:
-        _QA_STATE["queue"].append(dict(task))
+_LIVE_ASSISTANT_PREFIX = "__KB_LIVE_ASSISTANT__:"
 
 
-def _qa_cancel(task_id: str) -> None:
+def _live_assistant_text(task_id: str) -> str:
+    return f"{_LIVE_ASSISTANT_PREFIX}{str(task_id or '').strip()}"
+
+
+def _is_live_assistant_text(text: str) -> bool:
+    return str(text or "").strip().startswith(_LIVE_ASSISTANT_PREFIX)
+
+
+def _live_assistant_task_id(text: str) -> str:
+    s = str(text or "").strip()
+    if not s.startswith(_LIVE_ASSISTANT_PREFIX):
+        return ""
+    return s[len(_LIVE_ASSISTANT_PREFIX) :].strip()
+
+
+def _gen_get_task(session_id: str) -> dict | None:
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+    with RUNTIME.GEN_LOCK:
+        t = RUNTIME.GEN_TASKS.get(sid)
+        return dict(t) if isinstance(t, dict) else None
+
+
+def _gen_update_task(session_id: str, task_id: str, **patch) -> None:
+    sid = (session_id or "").strip()
     tid = (task_id or "").strip()
-    if not tid:
+    if (not sid) or (not tid):
         return
-    with _QA_LOCK:
-        cur = _QA_STATE.get("current") or {}
-        if isinstance(cur, dict) and str(cur.get("id") or "") == tid:
-            _QA_STATE["cancel_id"] = tid
+    with RUNTIME.GEN_LOCK:
+        cur = RUNTIME.GEN_TASKS.get(sid)
+        if not isinstance(cur, dict):
             return
-        q = list(_QA_STATE.get("queue") or [])
-        kept = [t for t in q if str((t or {}).get("id") or "") != tid]
-        _QA_STATE["queue"] = kept
+        if str(cur.get("id") or "") != tid:
+            return
+        nxt = dict(cur)
+        nxt.update(patch)
+        nxt["updated_at"] = time.time()
+        RUNTIME.GEN_TASKS[sid] = nxt
 
 
-def _qa_update_queued(task_id: str, *, prompt: str) -> bool:
-    tid = (task_id or "").strip()
-    new_prompt = (prompt or "").strip()
-    if (not tid) or (not new_prompt):
-        return False
-    changed = False
-    with _QA_LOCK:
-        q = list(_QA_STATE.get("queue") or [])
-        for i, t in enumerate(q):
-            if str((t or {}).get("id") or "") != tid:
-                continue
-            nt = dict(t or {})
-            nt["prompt"] = new_prompt
-            nt["prompt_sig"] = hashlib.sha1(new_prompt.encode("utf-8", "ignore")).hexdigest()[:12]
-            nt["updated_at"] = time.time()
-            q[i] = nt
-            changed = True
-            break
-        if changed:
-            _QA_STATE["queue"] = q
-    return changed
-
-
-def _qa_cancel_all(session_id: str | None = None) -> None:
+def _gen_should_cancel(session_id: str, task_id: str) -> bool:
     sid = (session_id or "").strip()
-    with _QA_LOCK:
-        if sid:
-            q = list(_QA_STATE.get("queue") or [])
-            _QA_STATE["queue"] = [t for t in q if str((t or {}).get("session_id") or "") != sid]
-            cur = _QA_STATE.get("current") or {}
-            if isinstance(cur, dict) and str(cur.get("session_id") or "") == sid:
-                _QA_STATE["cancel_id"] = str(cur.get("id") or "")
-        else:
-            _QA_STATE["queue"].clear()
-            cur = _QA_STATE.get("current") or {}
-            if isinstance(cur, dict):
-                _QA_STATE["cancel_id"] = str(cur.get("id") or "")
-
-
-def _qa_snapshot(*, session_id: str | None = None) -> dict:
-    sid = (session_id or "").strip()
-    with _QA_LOCK:
-        snap = dict(_QA_STATE)
-        snap["queue"] = [dict(t) for t in (_QA_STATE.get("queue") or []) if isinstance(t, dict) and ((not sid) or str(t.get("session_id") or "") == sid)]
-        cur = _QA_STATE.get("current")
-        if isinstance(cur, dict) and (sid and str(cur.get("session_id") or "") != sid):
-            snap["current"] = None
-        else:
-            snap["current"] = dict(cur) if isinstance(cur, dict) else None
-        snap["recent"] = [dict(t) for t in (_QA_STATE.get("recent") or []) if isinstance(t, dict) and ((not sid) or str(t.get("session_id") or "") == sid)]
-        return snap
-
-
-def _qa_should_cancel(task_id: str) -> bool:
     tid = (task_id or "").strip()
-    if not tid:
+    if (not sid) or (not tid):
+        return True
+    with RUNTIME.GEN_LOCK:
+        cur = RUNTIME.GEN_TASKS.get(sid)
+        if not isinstance(cur, dict):
+            return True
+        if str(cur.get("id") or "") != tid:
+            return True
+        return bool(cur.get("cancel") or False)
+
+
+def _gen_mark_cancel(session_id: str, task_id: str) -> bool:
+    sid = (session_id or "").strip()
+    tid = (task_id or "").strip()
+    if (not sid) or (not tid):
         return False
-    with _QA_LOCK:
-        return str(_QA_STATE.get("cancel_id") or "") == tid
+    with RUNTIME.GEN_LOCK:
+        cur = RUNTIME.GEN_TASKS.get(sid)
+        if not isinstance(cur, dict):
+            return False
+        if str(cur.get("id") or "") != tid:
+            return False
+        if str(cur.get("status") or "") != "running":
+            return False
+        cur2 = dict(cur)
+        cur2["cancel"] = True
+        cur2["stage"] = "canceled"
+        cur2["updated_at"] = time.time()
+        RUNTIME.GEN_TASKS[sid] = cur2
+        return True
 
 
-def _qa_push_recent(task: dict) -> None:
-    with _QA_LOCK:
-        arr = list(_QA_STATE.get("recent") or [])
-        arr.append(dict(task))
-        # Keep it small: only the last 16 tasks.
-        _QA_STATE["recent"] = arr[-16:]
+def _gen_store_answer(task: dict, answer: str) -> None:
+    conv_id = str(task.get("conv_id") or "")
+    chat_db = Path(str(task.get("chat_db") or "")).expanduser()
+    chat_store = ChatStore(chat_db)
+    try:
+        amid = int(task.get("assistant_msg_id") or 0)
+    except Exception:
+        amid = 0
+    if amid > 0:
+        ok = chat_store.update_message_content(amid, answer)
+        if not ok:
+            chat_store.append_message(conv_id, "assistant", answer)
+    else:
+        chat_store.append_message(conv_id, "assistant", answer)
 
 
-def _qa_worker_loop() -> None:
-    while True:
-        task = None
-        with _QA_LOCK:
-            cur = _QA_STATE.get("current")
-            if isinstance(cur, dict) and cur.get("status") == "running":
-                if not cur.get("started_at"):
-                    try:
-                        cur["started_at"] = float(cur.get("created_at") or time.time())
-                    except Exception:
-                        cur["started_at"] = time.time()
-                    _QA_STATE["current"] = dict(cur)
-                task = dict(cur)
-            elif _QA_STATE.get("queue"):
-                task = dict((_QA_STATE["queue"] or []).pop(0))
-                task.setdefault("status", "running")
-                task.setdefault("stage", "starting")
-                task.setdefault("partial", "")
-                task.setdefault("char_count", 0)
-                task.setdefault("refs_done", False)
-                task.setdefault("answer_done", False)
-                task.setdefault("started_at", float(task.get("created_at") or time.time()))
-                _QA_STATE["current"] = dict(task)
-                _QA_STATE["running"] = True
-                _QA_STATE["cancel_id"] = ""
-            else:
-                _QA_STATE["running"] = False
-                _QA_STATE["current"] = None
-                task = None
+def _gen_store_partial(task: dict, partial: str) -> None:
+    chat_db = Path(str(task.get("chat_db") or "")).expanduser()
+    chat_store = ChatStore(chat_db)
+    try:
+        amid = int(task.get("assistant_msg_id") or 0)
+    except Exception:
+        amid = 0
+    if amid <= 0:
+        return
+    txt = str(partial or "").strip()
+    if not txt:
+        return
+    try:
+        chat_store.update_message_content(amid, txt)
+    except Exception:
+        pass
 
-        if not task:
-            time.sleep(0.12)
-            continue
 
-        tid = str(task.get("id") or "")
-        try:
-            if _qa_should_cancel(tid):
-                raise RuntimeError("canceled")
+def _gen_worker(session_id: str, task_id: str) -> None:
+    task = _gen_get_task(session_id) or {}
+    if str(task.get("id") or "") != str(task_id or ""):
+        return
 
-            # Lazily construct stores/objects per task (thread-safe; sqlite uses WAL).
-            chat_db = Path(str(task.get("chat_db") or "")).expanduser()
-            chat_store = ChatStore(chat_db)
+    _gen_update_task(session_id, task_id, status="running", stage="starting", started_at=time.time())
 
-            db_dir = Path(str(task.get("db_dir") or "")).expanduser().resolve()
-            top_k = int(task.get("top_k") or 6)
-            temperature = float(task.get("temperature") or 0.2)
-            max_tokens = int(task.get("max_tokens") or 1200)
-            deep_read = bool(task.get("deep_read") or False)
-            llm_rerank = bool(task.get("llm_rerank") if ("llm_rerank" in task) else True)
+    try:
+        conv_id = str(task.get("conv_id") or "")
+        prompt = str(task.get("prompt") or "").strip()
+        chat_db = Path(str(task.get("chat_db") or "")).expanduser()
+        db_dir = Path(str(task.get("db_dir") or "")).expanduser()
+        top_k = int(task.get("top_k") or 6)
+        temperature = float(task.get("temperature") or 0.15)
+        max_tokens = int(task.get("max_tokens") or 1200)
+        deep_read = bool(task.get("deep_read"))
+        settings_obj = task.get("settings_obj")
+        chat_store = ChatStore(chat_db)
 
-            prompt = str(task.get("prompt") or "").strip()
-            conv_id = str(task.get("conv_id") or "").strip()
+        if (not conv_id) or (not prompt):
+            raise RuntimeError("invalid task")
+        if _gen_should_cancel(session_id, task_id):
+            raise RuntimeError("canceled")
 
-            quick_answer = _quick_answer_for_prompt(prompt)
-            if quick_answer:
-                try:
-                    umid_q = int(task.get("user_msg_id") or 0)
-                except Exception:
-                    umid_q = 0
-                if umid_q > 0:
-                    try:
-                        chat_store.upsert_message_refs(
-                            user_msg_id=umid_q,
-                            conv_id=conv_id,
-                            prompt=prompt,
-                            prompt_sig=str(task.get("prompt_sig") or ""),
-                            hits=[],
-                            scores=[],
-                            used_query="",
-                            used_translation=False,
-                        )
-                    except Exception:
-                        pass
-                chat_store.append_message(conv_id, "assistant", quick_answer)
-                done_task = None
-                with _QA_LOCK:
-                    if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                        _QA_STATE["current"]["stage"] = "answer"
-                        _QA_STATE["current"]["refs_done"] = True
-                        _QA_STATE["current"]["status"] = "done"
-                        _QA_STATE["current"]["answer_done"] = True
-                        _QA_STATE["current"]["answer"] = quick_answer
-                        _QA_STATE["current"]["finished_at"] = time.time()
-                        _QA_STATE["last"] = "done"
-                        done_task = dict(_QA_STATE["current"])
-                if isinstance(done_task, dict):
-                    _qa_push_recent(done_task)
-                continue
-
-            # Load retriever fresh (DB may change over time).
-            chunks = load_all_chunks(db_dir)
-            retriever = BM25Retriever(chunks)
-
-            with _QA_LOCK:
-                if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                    _QA_STATE["current"]["stage"] = "retrieve"
-
-            hits_raw, scores_raw, used_query, used_translation = _search_hits_with_fallback(
-                prompt,
-                retriever,
-                top_k=top_k,
-                settings=task.get("settings_obj"),
-                allow_translate=True,
-            )
-            hits = _group_hits_by_top_heading(hits_raw, top_k=top_k)
-            with _QA_LOCK:
-                if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                    _QA_STATE["current"]["hits_count"] = int(len(hits_raw or []))
-            # Background worker must stay responsive: skip heavy full-md deep read here.
-            effective_deep_read = False
-
-            # Refs pack (for UI panel; can be slower but runs in background).
-            grouped_docs: list[dict] = []
-            if (not getattr(retriever, "is_empty", False)) and prompt:
-                with _QA_LOCK:
-                    if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                        _QA_STATE["current"]["stage"] = "refs"
-                try:
-                    grouped_docs = _group_hits_by_doc_for_refs_fast(hits_raw, top_k_docs=top_k)
-                except Exception:
-                    grouped_docs = []
-
-            # Build context (coarse hits + deep-read snippets).
-            with _QA_LOCK:
-                if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                    _QA_STATE["current"]["stage"] = "context"
-                    _QA_STATE["current"]["used_query"] = used_query
-                    _QA_STATE["current"]["used_translation"] = bool(used_translation)
-                    _QA_STATE["current"]["refs_hits"] = grouped_docs
-                    _QA_STATE["current"]["refs_done"] = True
-                    _QA_STATE["current"]["refs_scores"] = list(scores_raw or [])
-
-            # Persist refs for this user message so each answered turn can keep its own
-            # "参考定位" in history (not only the latest one).
+        quick_answer = _quick_answer_for_prompt(prompt)
+        if quick_answer is not None:
             try:
-                umid = int(task.get("user_msg_id") or 0)
+                umid0 = int(task.get("user_msg_id") or 0)
             except Exception:
-                umid = 0
-            if umid > 0:
+                umid0 = 0
+            if umid0 > 0:
                 try:
                     chat_store.upsert_message_refs(
-                        user_msg_id=umid,
+                        user_msg_id=umid0,
                         conv_id=conv_id,
                         prompt=prompt,
                         prompt_sig=str(task.get("prompt_sig") or ""),
-                        hits=list(grouped_docs or []),
-                        scores=list(scores_raw or []),
-                        used_query=str(used_query or ""),
-                        used_translation=bool(used_translation),
+                        hits=[],
+                        scores=[],
+                        used_query="",
+                        used_translation=False,
                     )
                 except Exception:
                     pass
+            _gen_store_answer(task, quick_answer)
+            _gen_update_task(session_id, task_id, status="done", stage="done", answer=quick_answer, partial=quick_answer, char_count=len(quick_answer), finished_at=time.time())
+            return
 
-            ctx_parts: list[str] = []
-            doc_first_idx: dict[str, int] = {}
-            for i, h in enumerate(hits, start=1):
-                meta = h.get("meta", {}) or {}
-                src = (meta.get("source_path", "") or "").strip()
-                if src and src not in doc_first_idx:
-                    doc_first_idx[src] = i
-                src_name = Path(src).name if src else ""
-                top = meta.get("top_heading") or _top_heading(meta.get("heading_path", ""))
-                top = "" if _is_probably_bad_heading(top) else top
-                header = f"[{i}] {src_name or 'unknown'}" + (f" | {top}" if top else "")
-                body = h.get("text", "") or ""
-                ctx_parts.append(header + "\n" + body)
+        chunks = load_all_chunks(db_dir)
+        retriever = BM25Retriever(chunks)
 
-            deep_added = 0
-            deep_docs = 0
-            if effective_deep_read and hits:
-                q_fine = (used_query or prompt or "").strip()
-                q_alt = (prompt or "").strip()
-                items = list(doc_first_idx.items())[:3]
-                for (src, idx0) in items:
-                    if _qa_should_cancel(tid):
-                        raise RuntimeError("canceled")
-                    p = Path(src)
-                    extras: list[dict] = []
-                    if q_fine:
-                        extras.extend(_deep_read_md_for_context(p, q_fine, max_snippets=2, snippet_chars=1400))
-                    if q_alt and q_alt != q_fine:
-                        extras.extend(_deep_read_md_for_context(p, q_alt, max_snippets=1, snippet_chars=1400))
-                    if not extras:
-                        continue
-                    deep_docs += 1
-                    seen_snip = set()
-                    extras2: list[str] = []
-                    for ex in sorted(extras, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True):
-                        t = (ex.get("text") or "").strip()
-                        if not t:
-                            continue
-                        k = hashlib.sha1(t.encode("utf-8", "ignore")).hexdigest()[:12]
-                        if k in seen_snip:
-                            continue
-                        seen_snip.add(k)
-                        extras2.append(t)
-                        if len(extras2) >= 3:
-                            break
-                    if not extras2:
-                        continue
-                    try:
-                        base = ctx_parts[idx0 - 1]
-                    except Exception:
-                        continue
-                    for t in extras2:
-                        if t in base:
-                            continue
-                        base += "\n\n（深读补充定位：来自原文）\n" + t
-                        deep_added += 1
-                    ctx_parts[idx0 - 1] = base
+        _gen_update_task(session_id, task_id, stage="retrieve")
+        hits_raw, scores_raw, used_query, used_translation = _search_hits_with_fallback(
+            prompt,
+            retriever,
+            top_k=top_k,
+            settings=settings_obj,
+        )
+        hits = _group_hits_by_top_heading(hits_raw, top_k=top_k)
 
-            ctx = "\n\n---\n\n".join(ctx_parts)
-
-            with _QA_LOCK:
-                if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                    _QA_STATE["current"]["deep_read_docs"] = int(deep_docs)
-                    _QA_STATE["current"]["deep_read_added"] = int(deep_added)
-
-            system = (
-                "你的名字是 π-zaya。\n"
-                "如果用户问‘你是谁/你叫什么/你是谁开发的’之类的问题，统一回答：我是 P&I Lab 开发的 π-zaya。\n"
-                "你是我的个人知识库助手。优先基于我提供的检索片段回答问题。\n"
-                "规则：\n"
-                "1) 如果检索片段存在：优先基于片段回答；需要引用时，用 [1] [2] 这样的编号标注。\n"
-                "2) 如果检索片段为空：也要给出可用的通用回答，但开头必须写明‘未命中知识库片段’。\n"
-                "3) 不要编造不存在的论文、公式、数据或结论。\n"
-                "4) 不要输出‘参考定位/Top-K/引用列表’之类的额外段落（我会在页面里单独展示）。\n"
-                "5) 数学公式输出格式：短的变量/符号用 $...$（行内）；较长的等式/推导用 $$...$$（行间）。不要用反引号包裹公式。\n"
-            )
-
-            user = f"问题：\n{prompt}\n\n检索片段（含深读补充定位）：\n{ctx if ctx else '(无)'}\n"
+        grouped_docs: list[dict] = []
+        _gen_update_task(session_id, task_id, stage="refs")
+        if (not getattr(retriever, "is_empty", False)) and prompt:
             try:
-                user_msg_id = int(task.get("user_msg_id") or 0)
+                grouped_docs = _group_hits_by_doc_for_refs_fast(hits_raw, top_k_docs=top_k)
             except Exception:
-                user_msg_id = 0
-            if user_msg_id > 0:
-                history = chat_store.get_messages_upto_id(conv_id, user_msg_id)
-            else:
-                history = chat_store.get_messages(conv_id)
-            hist = [m for m in history if m.get("role") in ("user", "assistant")][-10:]
-            messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": user}]
+                grouped_docs = []
 
-            with _QA_LOCK:
-                if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                    _QA_STATE["current"]["stage"] = "answer"
-
-            settings_obj = task.get("settings_obj")
-            ds = DeepSeekChat(settings_obj)
-            partial = ""
-            last_ui = time.monotonic()
-            stream_err: Exception | None = None
+        try:
+            umid = int(task.get("user_msg_id") or 0)
+        except Exception:
+            umid = 0
+        if umid > 0:
             try:
-                for piece in ds.chat_stream(messages=messages, temperature=temperature, max_tokens=max_tokens):
-                    if _qa_should_cancel(tid):
-                        raise RuntimeError("canceled")
-                    if not piece:
-                        continue
-                    partial += piece
-                    now = time.monotonic()
-                    if (now - last_ui) >= 0.05 or ("\n" in piece) or ("。" in piece) or ("，" in piece):
-                        with _QA_LOCK:
-                            if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                                _QA_STATE["current"]["stage"] = "answer"
-                                _QA_STATE["current"]["partial"] = partial
-                                _QA_STATE["current"]["char_count"] = int(len(partial))
-                        last_ui = now
-            except Exception as e:
-                stream_err = e
+                chat_store.upsert_message_refs(
+                    user_msg_id=umid,
+                    conv_id=conv_id,
+                    prompt=prompt,
+                    prompt_sig=str(task.get("prompt_sig") or ""),
+                    hits=list(grouped_docs or []),
+                    scores=list(scores_raw or []),
+                    used_query=str(used_query or ""),
+                    used_translation=bool(used_translation),
+                )
+            except Exception:
+                pass
 
-            if _qa_should_cancel(tid):
-                raise RuntimeError("canceled")
+        _gen_update_task(session_id, task_id, stage="context", used_query=str(used_query or ""), used_translation=bool(used_translation), refs_done=True)
 
-            # Fallback to non-streaming when streaming yields nothing.
-            if not (partial or "").strip():
-                if isinstance(stream_err, Exception) and str(stream_err) == "canceled":
+        ctx_parts: list[str] = []
+        doc_first_idx: dict[str, int] = {}
+        # Keep prompt compact for fast first-token latency.
+        answer_hits = list(hits[: max(1, min(int(top_k), 4))])
+        for i, h in enumerate(answer_hits, start=1):
+            meta = h.get("meta", {}) or {}
+            src = (meta.get("source_path", "") or "").strip()
+            if src and src not in doc_first_idx:
+                doc_first_idx[src] = i
+            src_name = Path(src).name if src else ""
+            top = meta.get("top_heading") or _top_heading(meta.get("heading_path", ""))
+            top = "" if _is_probably_bad_heading(top) else top
+            header = f"[{i}] {src_name or 'unknown'}" + (f" | {top}" if top else "")
+            body = h.get("text", "") or ""
+            ctx_parts.append(header + "\n" + body)
+
+        deep_added = 0
+        deep_docs = 0
+        if deep_read and answer_hits:
+            deep_budget_s = 4.0
+            deep_begin = time.monotonic()
+            q_fine = (used_query or prompt or "").strip()
+            items = list(doc_first_idx.items())[:1]
+            total = len(items)
+            for n, (src, idx0) in enumerate(items, start=1):
+                if _gen_should_cancel(session_id, task_id):
                     raise RuntimeError("canceled")
-                resp = (ds.chat(messages=messages, temperature=temperature, max_tokens=max_tokens) or "")
-                # Progressive replay: keep UI incremental even when provider returns full text at once.
-                if resp:
-                    piece_len = 32
-                    buf = ""
-                    for i in range(0, len(resp), piece_len):
-                        if _qa_should_cancel(tid):
-                            raise RuntimeError("canceled")
-                        buf += resp[i : i + piece_len]
-                        partial = buf
-                        with _QA_LOCK:
-                            if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                                _QA_STATE["current"]["partial"] = partial
-                                _QA_STATE["current"]["char_count"] = int(len(partial))
-                        time.sleep(0.006)
-                else:
-                    partial = resp
+                if (time.monotonic() - deep_begin) >= deep_budget_s:
+                    _gen_update_task(session_id, task_id, stage="deep-read skipped (timeout)")
+                    break
+                _gen_update_task(session_id, task_id, stage=f"deep-read {n}/{total}")
+                p = Path(src)
+                extras: list[dict] = []
+                if q_fine:
+                    extras.extend(_deep_read_md_for_context(p, q_fine, max_snippets=1, snippet_chars=900))
+                if not extras:
+                    continue
+                deep_docs += 1
+                seen_snip = set()
+                extras2: list[str] = []
+                for ex in sorted(extras, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True):
+                    t = (ex.get("text") or "").strip()
+                    if not t:
+                        continue
+                    k = hashlib.sha1(t.encode("utf-8", "ignore")).hexdigest()[:12]
+                    if k in seen_snip:
+                        continue
+                    seen_snip.add(k)
+                    extras2.append(t)
+                    if len(extras2) >= 1:
+                        break
+                if not extras2:
+                    continue
+                try:
+                    base = ctx_parts[idx0 - 1]
+                except Exception:
+                    continue
+                for t in extras2:
+                    if t in base:
+                        continue
+                    base += "\n\n（深读补充定位：来自原文）\n" + t
+                    deep_added += 1
+                ctx_parts[idx0 - 1] = base
 
-            with _QA_LOCK:
-                if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                    _QA_STATE["current"]["partial"] = partial
-                    _QA_STATE["current"]["char_count"] = int(len(partial))
+        _gen_update_task(session_id, task_id, deep_read_docs=int(deep_docs), deep_read_added=int(deep_added), stage="answer")
+        ctx = "\n\n---\n\n".join(ctx_parts)
 
-            answer = _normalize_math_markdown(_strip_model_ref_section(partial or "")).strip() or "（未返回文本）"
-            chat_store.append_message(conv_id, "assistant", answer)
+        system = (
+            "你的名字是 π-zaya。\n"
+            "如果用户问‘你是谁/你叫什么/你是谁开发的’之类的问题，统一回答：我是 P&I Lab 开发的 π-zaya。\n"
+            "你是我的个人知识库助手。优先基于我提供的检索片段回答问题。\n"
+            "规则：\n"
+            "1) 如果检索片段存在：优先基于片段回答；需要引用时，用 [1] [2] 这样的编号标注。\n"
+            "2) 如果检索片段为空：也要给出可用的通用回答，但开头必须写明‘未命中知识库片段’。\n"
+            "3) 不要编造不存在的论文、公式、数据或结论。\n"
+            "4) 不要输出‘参考定位/Top-K/引用列表’之类的额外段落（我会在页面里单独展示）。\n"
+            "5) 数学公式输出格式：短的变量/符号用 $...$（行内）；较长的等式/推导用 $$...$$（行间）。不要用反引号包裹公式。\n"
+        )
+        user = f"问题：\n{prompt}\n\n检索片段（含深读补充定位）：\n{ctx if ctx else '(无)'}\n"
+        history = chat_store.get_messages(conv_id)
+        hist = [m for m in history if m.get("role") in ("user", "assistant")][-10:]
+        messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": user}]
 
-            done_task = None
-            with _QA_LOCK:
-                if isinstance(_QA_STATE.get("current"), dict) and str(_QA_STATE["current"].get("id") or "") == tid:
-                    _QA_STATE["current"]["status"] = "done"
-                    _QA_STATE["current"]["answer_done"] = True
-                    _QA_STATE["current"]["answer"] = answer
-                    _QA_STATE["current"]["finished_at"] = time.time()
-                    _QA_STATE["last"] = "done"
-                    done_task = dict(_QA_STATE["current"])
-            if isinstance(done_task, dict):
-                _qa_push_recent(done_task)
-        except Exception as e:
-            canceled = str(e) == "canceled"
-            done_task = None
-            with _QA_LOCK:
-                cur = _QA_STATE.get("current") or {}
-                if isinstance(cur, dict) and str(cur.get("id") or "") == tid:
-                    cur["finished_at"] = time.time()
-                    if canceled:
-                        cur["status"] = "canceled"
-                        cur["answer_done"] = True
-                        cur["answer"] = (str(cur.get("partial") or "").strip() + "\n\n（已停止生成）").strip() or "（已停止生成）"
-                        try:
-                            chat_db = Path(str(cur.get("chat_db") or "")).expanduser()
-                            ChatStore(chat_db).append_message(str(cur.get("conv_id") or ""), "assistant", str(cur["answer"]))
-                        except Exception:
-                            pass
-                        _QA_STATE["cancel_id"] = ""
-                    else:
-                        cur["status"] = "error"
-                        cur["error"] = str(e)
-                        cur["answer_done"] = True
-                        cur["answer"] = S["llm_fail"].format(err=str(e))
-                        try:
-                            chat_db = Path(str(cur.get("chat_db") or "")).expanduser()
-                            ChatStore(chat_db).append_message(str(cur.get("conv_id") or ""), "assistant", str(cur["answer"]))
-                        except Exception:
-                            pass
-                    _QA_STATE["current"] = dict(cur)
-                    done_task = dict(cur)
-            if isinstance(done_task, dict):
-                _qa_push_recent(done_task)
-        finally:
-            with _QA_LOCK:
-                cur2 = _QA_STATE.get("current") or {}
-                if isinstance(cur2, dict) and str(cur2.get("id") or "") == tid:
-                    # Clear current so next task can start.
-                    _QA_STATE["current"] = None
-                    _QA_STATE["running"] = bool(_QA_STATE.get("queue"))
-            time.sleep(0.05)
+        ds = DeepSeekChat(settings_obj)
+        partial = ""
+        streamed = False
+        last_store_ts = 0.0
+        last_store_len = 0
+        try:
+            for piece in ds.chat_stream(messages=messages, temperature=temperature, max_tokens=max_tokens):
+                if _gen_should_cancel(session_id, task_id):
+                    raise RuntimeError("canceled")
+                partial += piece
+                streamed = True
+                _gen_update_task(session_id, task_id, stage="answer", partial=partial, char_count=len(partial))
+                now = time.monotonic()
+                # Reduce sqlite write frequency while still keeping crash-recovery checkpoints.
+                if (
+                    ((now - last_store_ts) >= 0.9 and (len(partial) - last_store_len) >= 48)
+                    or (("\n\n" in piece) and (len(partial) - last_store_len) >= 120)
+                ):
+                    _gen_store_partial(task, partial)
+                    last_store_ts = now
+                    last_store_len = len(partial)
+        except Exception:
+            if streamed:
+                if _gen_should_cancel(session_id, task_id):
+                    raise RuntimeError("canceled")
+            else:
+                resp = ds.chat(messages=messages, temperature=temperature, max_tokens=max_tokens)
+                partial = str(resp or "")
+                _gen_update_task(session_id, task_id, stage="answer", partial=partial, char_count=len(partial))
 
+        if _gen_should_cancel(session_id, task_id):
+            answer = (str(partial or "").strip() + "\n\n（已停止生成）").strip() or "（已停止生成）"
+            _gen_store_answer(task, answer)
+            _gen_update_task(session_id, task_id, status="canceled", stage="canceled", answer=answer, partial=answer, char_count=len(answer), finished_at=time.time())
+            return
 
-def _qa_ensure_started() -> None:
-    t = getattr(RUNTIME, "QA_THREAD", None)
-    if t is not None and t.is_alive():
-        return
-    try:
-        t = threading.Thread(target=_qa_worker_loop, daemon=True)
-        RUNTIME.QA_THREAD = t
-        t.start()
+        answer = _normalize_math_markdown(_strip_model_ref_section(partial or "")).strip() or "（未返回文本）"
+        _gen_store_answer(task, answer)
+        _gen_update_task(session_id, task_id, status="done", stage="done", answer=answer, partial=answer, char_count=len(answer), finished_at=time.time())
+
     except Exception as e:
-        with _QA_LOCK:
-            _QA_STATE["last"] = f"thread_start_fail: {e}"
-            _QA_STATE["running"] = False
-            _QA_STATE["current"] = None
+        if str(e) == "canceled":
+            snap = _gen_get_task(session_id) or {}
+            partial = str(snap.get("partial") or "").strip()
+            answer = (partial + "\n\n（已停止生成）").strip() or "（已停止生成）"
+            try:
+                _gen_store_answer(task, answer)
+            except Exception:
+                pass
+            _gen_update_task(session_id, task_id, status="canceled", stage="canceled", answer=answer, partial=answer, char_count=len(answer), finished_at=time.time())
+            return
+
+        err = S["llm_fail"].format(err=str(e))
+        try:
+            _gen_store_answer(task, err)
+        except Exception:
+            pass
+        _gen_update_task(session_id, task_id, status="error", stage="error", error=str(e), answer=err, partial=err, char_count=len(err), finished_at=time.time())
+
+
+def _gen_start_task(task: dict) -> bool:
+    sid = str(task.get("session_id") or "").strip()
+    tid = str(task.get("id") or "").strip()
+    if (not sid) or (not tid):
+        return False
+    with RUNTIME.GEN_LOCK:
+        cur = RUNTIME.GEN_TASKS.get(sid)
+        if isinstance(cur, dict) and str(cur.get("status") or "") == "running":
+            return False
+        item = dict(task)
+        item.setdefault("status", "running")
+        item.setdefault("stage", "starting")
+        item.setdefault("partial", "")
+        item.setdefault("char_count", 0)
+        item.setdefault("cancel", False)
+        item.setdefault("created_at", time.time())
+        item.setdefault("updated_at", time.time())
+        RUNTIME.GEN_TASKS[sid] = item
+    try:
+        threading.Thread(target=_gen_worker, args=(sid, tid), daemon=True).start()
+    except Exception:
+        with RUNTIME.GEN_LOCK:
+            cur = RUNTIME.GEN_TASKS.get(sid)
+            if isinstance(cur, dict) and str(cur.get("id") or "") == tid:
+                cur2 = dict(cur)
+                cur2["status"] = "error"
+                cur2["stage"] = "error"
+                cur2["answer"] = "线程启动失败"
+                cur2["finished_at"] = time.time()
+                RUNTIME.GEN_TASKS[sid] = cur2
+        return False
+    return True
 
 
 def _bg_enqueue(task: dict) -> None:
@@ -740,8 +666,11 @@ def _init_theme_css() -> None:
 :root{
   --bg: #f7f8fb;
   --panel: #ffffff;
+  --sidebar-bg: #fbfdff;
   --line: rgba(49, 51, 63, 0.12);
   --muted: rgba(49, 51, 63, 0.64);
+  --text-main: #1f2a37;
+  --text-soft: rgba(49, 51, 63, 0.72);
   --blue-weak: #eef5ff;
   --blue-line: rgba(47, 111, 237, 0.28);
   --font-display: "LittleP", "Segoe UI", "Microsoft YaHei", "PingFang SC", system-ui, -apple-system, sans-serif;
@@ -758,11 +687,54 @@ def _init_theme_css() -> None:
   --pill-warn: rgba(180, 83, 9, 0.95);
   --pill-run-bg: rgba(47, 111, 237, 0.12);
   --pill-run: rgba(29, 78, 216, 0.95);
+  --input-bg: #ffffff;
+  --input-border: rgba(49, 51, 63, 0.16);
+  --msg-user-bg: #eaf2ff;
+  --msg-user-border: rgba(47,111,237,0.18);
+  --msg-user-text: #1f2a37;
+  --msg-ai-bg: #ffffff;
+  --msg-ai-border: rgba(49,51,63,0.10);
+  --snip-bg: rgba(49,51,63,0.04);
+  --snip-border: rgba(49,51,63,0.10);
+  --snip-text: rgba(15, 23, 42, 0.86);
+  --snip-quote-bg: rgba(47,111,237,0.08);
+  --snip-quote-border: rgba(47,111,237,0.26);
+  --snip-mark-bg: rgba(251,191,36,0.36);
+  --snip-mark-text: #0f172a;
+  --notice-text: rgba(120, 53, 15, 0.95);
+  --notice-bg: rgba(245, 158, 11, 0.10);
+  --notice-border: rgba(245, 158, 11, 0.18);
+  --ref-accent: rgba(47,111,237,0.16);
+  --dock-bg: linear-gradient(180deg, rgba(246,248,252,0.72) 0%, rgba(246,248,252,0.96) 18%, rgba(246,248,252,0.99) 100%);
+  --dock-border: rgba(49,51,63,0.10);
+  --dock-shadow: 0 -8px 26px rgba(16,24,40,0.08);
+  --copy-btn-bg: rgba(255,255,255,0.80);
+  --copy-btn-border: rgba(49, 51, 63, 0.14);
+  --copy-btn-text: rgba(31, 42, 55, 0.86);
+  --toast-bg: rgba(255,255,255,0.92);
+  --toast-border: rgba(49,51,63,0.14);
+  --toast-text: rgba(31,42,55,0.88);
+  --hint-text: rgba(49,51,63,0.48);
 }
-html, body { background: var(--bg); font-family: var(--font-body); }
-.block-container{ max-width: 1020px; padding-top: 1.6rem; padding-bottom: 6.2rem; }
-section[data-testid="stSidebar"] > div:first-child{ background: #fbfdff; border-right: 1px solid var(--line); }
-h1, h2, h3 { color: #1f2a37; letter-spacing: -0.01em; }
+html, body { background: var(--bg); color: var(--text-main); font-family: var(--font-body); color-scheme: light; }
+/* Keep UI readable during frequent reruns (avoid global "grayed out" stale look). */
+[data-stale="true"]{
+  opacity: 1 !important;
+  filter: none !important;
+}
+:root{
+  --content-max: 1220px;
+}
+.block-container{
+  width: 100%;
+  max-width: var(--content-max);
+  margin-left: auto !important;
+  margin-right: auto !important;
+  padding-top: 1.6rem;
+  padding-bottom: 12.2rem;
+}
+section[data-testid="stSidebar"] > div:first-child{ background: var(--sidebar-bg); border-right: 1px solid var(--line); }
+h1, h2, h3 { color: var(--text-main); letter-spacing: -0.01em; }
 h1 { font-family: var(--font-display); font-weight: 800; }
 small, .stCaption { color: var(--muted) !important; }
 div.stButton > button{
@@ -807,13 +779,18 @@ div.stButton > button:focus-visible{
   outline: none !important;
   box-shadow: 0 1px 0 rgba(16, 24, 40, 0.03) !important;
 }
-textarea, input{ background: var(--panel) !important; border-radius: 12px !important; }
+textarea, input{
+  background: var(--input-bg) !important;
+  color: var(--text-main) !important;
+  border: 1px solid var(--input-border) !important;
+  border-radius: 12px !important;
+}
 pre{ border-radius: 12px !important; }
-.refbox { font-size: 0.92rem; color: rgba(49, 51, 63, 0.62); }
-.refbox code { color: rgba(49, 51, 63, 0.70); }
+.refbox { font-size: 0.92rem; color: var(--muted); }
+.refbox code { color: var(--text-soft); }
 .snipbox{
-  background: rgba(49,51,63,0.04);
-  border: 1px solid rgba(49,51,63,0.10);
+  background: var(--snip-bg);
+  border: 1px solid var(--snip-border);
   border-radius: 12px;
   padding: 10px 12px;
   margin: 0.35rem 0 0.55rem 0;
@@ -824,12 +801,36 @@ pre{ border-radius: 12px !important; }
   word-break: break-word;
   font-size: 0.86rem;
   line-height: 1.38;
-  color: rgba(15, 23, 42, 0.86);
+  color: var(--snip-text);
   background: transparent !important;
 }
+.snipquote{
+  border-left: 3px solid var(--snip-quote-border);
+  background: var(--snip-quote-bg);
+  border-radius: 10px;
+  padding: 9px 11px;
+  margin: 0.15rem 0 0.45rem 0;
+}
+.snipquote .snipquote-title{
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0 0 0.25rem 0;
+}
+.snipquote .snipquote-body{
+  font-size: 0.88rem;
+  line-height: 1.42;
+  color: var(--text-main);
+}
+.snipquote mark{
+  background: var(--snip-mark-bg);
+  color: var(--snip-mark-text);
+  padding: 0 0.15em;
+  border-radius: 0.2em;
+}
 .msg-user{
-  background: #eaf2ff;
-  border: 1px solid rgba(47,111,237,0.18);
+  background: var(--msg-user-bg);
+  border: 1px solid var(--msg-user-border);
+  color: var(--msg-user-text);
   border-radius: 16px;
   padding: 10px 14px;
   width: fit-content;
@@ -845,17 +846,17 @@ pre{ border-radius: 12px !important; }
   max-width: min(900px, 94%);
 }
 .msg-ai-stream{
-  background: #ffffff;
-  border: 1px solid rgba(49,51,63,0.10);
+  background: var(--msg-ai-bg);
+  border: 1px solid var(--msg-ai-border);
   border-radius: 14px;
   padding: 12px 14px;
   box-shadow: 0 1px 0 rgba(16,24,40,0.03);
 }
 .kb-notice{
   font-size: 0.84rem;
-  color: rgba(120, 53, 15, 0.95);
-  background: rgba(245, 158, 11, 0.10);
-  border: 1px solid rgba(245, 158, 11, 0.18);
+  color: var(--notice-text);
+  background: var(--notice-bg);
+  border: 1px solid var(--notice-border);
   border-radius: 10px;
   padding: 0.35rem 0.55rem;
   margin: 0 0 0.55rem 0;
@@ -889,26 +890,23 @@ pre{ border-radius: 12px !important; }
   letter-spacing: -0.01em;
 }
 .kb-modal .refbox{ margin-top: 0.35rem; }
-.msg-meta{ color: rgba(49,51,63,0.62); font-size: 0.86rem; margin-bottom: 0.35rem; }
+.msg-meta{ color: var(--muted); font-size: 0.86rem; margin-bottom: 0.35rem; }
 .hr{ height:1px; background: rgba(49,51,63,0.10); margin: 1.0rem 0; }
 .msg-refs{
   margin: 0.35rem 0 0.80rem 0;
   padding: 0.20rem 0.30rem;
-  border-left: 2px solid rgba(47,111,237,0.16);
+  border-left: 2px solid var(--ref-accent);
 }
-.queue-inline-head{
-  font-size: 0.84rem;
-  color: rgba(49,51,63,0.68);
-  margin: 0.10rem 0 0.25rem 0;
-  font-weight: 600;
-}
-.queue-inline-hint{
-  font-size: 0.82rem;
-  color: rgba(49,51,63,0.56);
-  margin: 0.08rem 0 0.42rem 0;
+.chat-empty-state{
+  max-width: 540px;
+  margin: 5.2rem auto 6.2rem auto;
+  text-align: center;
+  font-size: 0.95rem;
+  color: var(--muted);
+  line-height: 1.52;
 }
 /* Small "generation details" text (GPT-ish, no chain-of-thought) */
-.genbox { font-size: 0.86rem; color: rgba(49,51,63,0.62); }
+.genbox { font-size: 0.86rem; color: var(--muted); }
 .genbox code { font-size: 0.84rem; }
 
 /* Reference list: make per-item buttons compact and not full-width */
@@ -974,24 +972,41 @@ div[data-testid="stTextArea"]::after{
   right: 14px;
   bottom: 10px;
   font-size: 12px;
-  color: rgba(49,51,63,0.48);
+  color: var(--hint-text);
   pointer-events: none;
 }
 
 /* ChatGPT/Codex-like composer dock */
 .kb-input-dock{
-  position: sticky !important;
-  bottom: 0.35rem;
-  z-index: 24;
-  background: linear-gradient(180deg, rgba(246,248,252,0.72) 0%, rgba(246,248,252,0.96) 18%, rgba(246,248,252,0.99) 100%);
-  border: 1px solid rgba(49,51,63,0.10);
-  border-radius: 16px;
-  padding: 0.52rem 0.56rem 0.22rem 0.56rem;
-  box-shadow: 0 -8px 26px rgba(16,24,40,0.08);
+  position: fixed !important;
+  bottom: 10px;
+  bottom: max(10px, env(safe-area-inset-bottom, 0px));
+  z-index: 40;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(var(--content-max), calc(100vw - 1.6rem));
+  box-sizing: border-box;
+  background: var(--dock-bg);
+  border: 1px solid var(--dock-border);
+  border-radius: 20px;
+  padding: 0.48rem 0.56rem 0.18rem 0.56rem;
+  box-shadow: var(--dock-shadow);
   backdrop-filter: blur(5px);
+  margin: 0 !important;
+}
+.kb-input-dock.kb-dock-positioned{
+  max-width: none !important;
 }
 .kb-input-dock div[data-testid="stForm"]{
   margin-bottom: 0 !important;
+}
+.kb-input-dock::before{
+  content: "问点什么...（会先检索你的 Markdown 再回答）";
+  display: block;
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.2;
+  margin: 0 0 0.32rem 0.16rem;
 }
 .kb-input-dock div[data-testid="stTextInput"]{
   margin-bottom: 0.05rem !important;
@@ -999,6 +1014,29 @@ div[data-testid="stTextArea"]::after{
 .kb-input-dock div[data-testid="stTextInput"] input{
   min-height: 34px !important;
   font-size: 13px !important;
+}
+.kb-input-dock div[data-testid="stTextArea"] label{
+  display: none !important;
+}
+.kb-input-dock textarea{
+  min-height: 92px !important;
+  border-radius: 14px !important;
+}
+.kb-input-dock div[data-testid="stFormSubmitButton"]{
+  display: flex !important;
+  justify-content: flex-end !important;
+  margin-top: 0.38rem !important;
+}
+.kb-input-dock div[data-testid="stFormSubmitButton"] > button{
+  width: 40px !important;
+  min-width: 40px !important;
+  height: 40px !important;
+  min-height: 40px !important;
+  border-radius: 999px !important;
+  padding: 0 !important;
+  font-size: 1.05rem !important;
+  font-weight: 760 !important;
+  line-height: 1 !important;
 }
 
 /* Copy bar above assistant answers */
@@ -1014,9 +1052,9 @@ div[data-testid="stTextArea"]::after{
   justify-content: center;
   padding: 6px 10px;
   border-radius: 10px;
-  border: 1px solid rgba(49, 51, 63, 0.14);
-  background: rgba(255,255,255,0.8);
-  color: rgba(31, 42, 55, 0.86);
+  border: 1px solid var(--copy-btn-border);
+  background: var(--copy-btn-bg);
+  color: var(--copy-btn-text);
   font-weight: 600;
   font-size: 12px;
   cursor: pointer;
@@ -1025,12 +1063,12 @@ div[data-testid="stTextArea"]::after{
 .kb-copybtn:hover{
   background: rgba(47,111,237,0.06);
   border-color: rgba(47,111,237,0.22);
-  color: rgba(31, 42, 55, 0.86);
+  color: var(--copy-btn-text);
 }
 .kb-copybtn:active{
   background: rgba(47,111,237,0.10);
   border-color: rgba(47,111,237,0.26);
-  color: rgba(31, 42, 55, 0.86);
+  color: var(--copy-btn-text);
 }
 
 /* Code-block copy button (in-page, not Streamlit built-in) */
@@ -1040,9 +1078,9 @@ div[data-testid="stTextArea"]::after{
   right: 10px;
   padding: 4px 8px;
   border-radius: 10px;
-  border: 1px solid rgba(49, 51, 63, 0.12);
-  background: rgba(255,255,255,0.78);
-  color: rgba(31, 42, 55, 0.80);
+  border: 1px solid var(--copy-btn-border);
+  background: var(--copy-btn-bg);
+  color: var(--copy-btn-text);
   font-weight: 600;
   font-size: 12px;
   cursor: pointer;
@@ -1059,9 +1097,9 @@ div[data-testid="stTextArea"]::after{
   bottom: 18px;
   padding: 10px 12px;
   border-radius: 12px;
-  border: 1px solid rgba(49,51,63,0.14);
-  background: rgba(255,255,255,0.92);
-  color: rgba(31,42,55,0.88);
+  border: 1px solid var(--toast-border);
+  background: var(--toast-bg);
+  color: var(--toast-text);
   font-weight: 600;
   font-size: 12px;
   box-shadow: 0 1px 0 rgba(16, 24, 40, 0.04), 0 14px 34px rgba(16, 24, 40, 0.10);
@@ -1072,6 +1110,139 @@ div[data-testid="stTextArea"]::after{
   pointer-events: none;
 }
 .kb-toast.show{ opacity: 1; transform: translateY(0px); }
+
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg: #0f1117;
+    --panel: #161a23;
+    --sidebar-bg: #10151f;
+    --line: rgba(148, 163, 184, 0.24);
+    --muted: rgba(226, 232, 240, 0.72);
+    --text-main: #e5e7eb;
+    --text-soft: rgba(226, 232, 240, 0.82);
+    --blue-weak: rgba(96, 165, 250, 0.18);
+    --blue-line: rgba(96, 165, 250, 0.45);
+    --btn-bg: #1b2130;
+    --btn-border: rgba(148, 163, 184, 0.30);
+    --btn-text: #e5e7eb;
+    --btn-hover: rgba(96, 165, 250, 0.16);
+    --btn-active: rgba(96, 165, 250, 0.24);
+    --btn-shadow: 0 1px 0 rgba(0, 0, 0, 0.30), 0 12px 30px rgba(0, 0, 0, 0.40);
+    --input-bg: #0f1522;
+    --input-border: rgba(148, 163, 184, 0.28);
+    --msg-user-bg: rgba(59,130,246,0.18);
+    --msg-user-border: rgba(96,165,250,0.36);
+    --msg-user-text: #e6efff;
+    --msg-ai-bg: #151b27;
+    --msg-ai-border: rgba(148,163,184,0.22);
+    --snip-bg: rgba(148,163,184,0.10);
+    --snip-border: rgba(148,163,184,0.26);
+    --snip-text: rgba(226, 232, 240, 0.92);
+    --snip-quote-bg: rgba(96,165,250,0.14);
+    --snip-quote-border: rgba(96,165,250,0.44);
+    --snip-mark-bg: rgba(250,204,21,0.26);
+    --snip-mark-text: #f8fafc;
+    --notice-text: rgba(253, 230, 138, 0.98);
+    --notice-bg: rgba(245, 158, 11, 0.16);
+    --notice-border: rgba(245, 158, 11, 0.34);
+    --ref-accent: rgba(96,165,250,0.46);
+    --dock-bg: linear-gradient(180deg, rgba(15,17,23,0.70) 0%, rgba(15,17,23,0.93) 20%, rgba(15,17,23,0.98) 100%);
+    --dock-border: rgba(148,163,184,0.20);
+    --dock-shadow: 0 -10px 28px rgba(0,0,0,0.45);
+    --copy-btn-bg: rgba(30,41,59,0.76);
+    --copy-btn-border: rgba(148,163,184,0.30);
+    --copy-btn-text: rgba(226,232,240,0.94);
+    --toast-bg: rgba(15,23,42,0.95);
+    --toast-border: rgba(148,163,184,0.26);
+    --toast-text: rgba(226,232,240,0.94);
+    --hint-text: rgba(148,163,184,0.74);
+  }
+  html, body{
+    color-scheme: dark;
+  }
+  .hr{ background: rgba(148,163,184,0.22); }
+  .meta-kv{ color: rgba(226,232,240,0.70); }
+  .refslist div.stButton > button{
+    color: var(--text-main) !important;
+  }
+  .refslist div.stButton > button:hover{
+    background: rgba(96,165,250,0.10) !important;
+    border-color: rgba(96,165,250,0.26) !important;
+  }
+  .refslist div.stButton > button:active{
+    background: rgba(96,165,250,0.14) !important;
+    border-color: rgba(96,165,250,0.34) !important;
+  }
+}
+
+html[data-theme="dark"]{
+  --bg: #0f1117;
+  --panel: #161a23;
+  --sidebar-bg: #10151f;
+  --line: rgba(148, 163, 184, 0.24);
+  --muted: rgba(226, 232, 240, 0.72);
+  --text-main: #e5e7eb;
+  --text-soft: rgba(226, 232, 240, 0.82);
+  --blue-weak: rgba(96, 165, 250, 0.18);
+  --blue-line: rgba(96, 165, 250, 0.45);
+  --btn-bg: #1b2130;
+  --btn-border: rgba(148, 163, 184, 0.30);
+  --btn-text: #e5e7eb;
+  --btn-hover: rgba(96, 165, 250, 0.16);
+  --btn-active: rgba(96, 165, 250, 0.24);
+  --btn-shadow: 0 1px 0 rgba(0, 0, 0, 0.30), 0 12px 30px rgba(0, 0, 0, 0.40);
+  --input-bg: #0f1522;
+  --input-border: rgba(148, 163, 184, 0.28);
+  --msg-user-bg: rgba(59,130,246,0.18);
+  --msg-user-border: rgba(96,165,250,0.36);
+  --msg-user-text: #e6efff;
+  --msg-ai-bg: #151b27;
+  --msg-ai-border: rgba(148,163,184,0.22);
+  --snip-bg: rgba(148,163,184,0.10);
+  --snip-border: rgba(148,163,184,0.26);
+  --snip-text: rgba(226, 232, 240, 0.92);
+  --snip-quote-bg: rgba(96,165,250,0.14);
+  --snip-quote-border: rgba(96,165,250,0.44);
+  --snip-mark-bg: rgba(250,204,21,0.26);
+  --snip-mark-text: #f8fafc;
+  --notice-text: rgba(253, 230, 138, 0.98);
+  --notice-bg: rgba(245, 158, 11, 0.16);
+  --notice-border: rgba(245, 158, 11, 0.34);
+  --ref-accent: rgba(96,165,250,0.46);
+  --dock-bg: linear-gradient(180deg, rgba(15,17,23,0.70) 0%, rgba(15,17,23,0.93) 20%, rgba(15,17,23,0.98) 100%);
+  --dock-border: rgba(148,163,184,0.20);
+  --dock-shadow: 0 -10px 28px rgba(0,0,0,0.45);
+  --copy-btn-bg: rgba(30,41,59,0.76);
+  --copy-btn-border: rgba(148,163,184,0.30);
+  --copy-btn-text: rgba(226,232,240,0.94);
+  --toast-bg: rgba(15,23,42,0.95);
+  --toast-border: rgba(148,163,184,0.26);
+  --toast-text: rgba(226,232,240,0.94);
+  --hint-text: rgba(148,163,184,0.74);
+}
+html[data-theme="dark"], body[data-theme="dark"]{
+  color-scheme: dark;
+}
+html[data-theme="dark"] .hr, body[data-theme="dark"] .hr{
+  background: rgba(148,163,184,0.22);
+}
+html[data-theme="dark"] .meta-kv, body[data-theme="dark"] .meta-kv{
+  color: rgba(226,232,240,0.70);
+}
+html[data-theme="dark"] .refslist div.stButton > button,
+body[data-theme="dark"] .refslist div.stButton > button{
+  color: var(--text-main) !important;
+}
+html[data-theme="dark"] .refslist div.stButton > button:hover,
+body[data-theme="dark"] .refslist div.stButton > button:hover{
+  background: rgba(96,165,250,0.10) !important;
+  border-color: rgba(96,165,250,0.26) !important;
+}
+html[data-theme="dark"] .refslist div.stButton > button:active,
+body[data-theme="dark"] .refslist div.stButton > button:active{
+  background: rgba(96,165,250,0.14) !important;
+  border-color: rgba(96,165,250,0.34) !important;
+}
 
 /* Make <pre> relative for overlay button */
 pre { position: relative; }
@@ -2976,14 +3147,23 @@ def _render_refs(
 
         find_s = (", ".join(find[:3]) if en else "、".join(find[:3]))
         if en:
-            core = (f"{tag + ' ' if tag else ''}Find: {find_s or 'key definitions/method/experiments'}").strip()
+            tag_en = {"综述": "review", "方法": "method", "原理/机制": "mechanism"}.get(tag, "")
+            core = f"Find: {find_s or 'key definitions/method/experiments'}"
+            if tag_en:
+                core += f" ({tag_en})"
             if sec:
-                return (core + f"; See: {sec}.") + (f" {warn}" if warn else "")
-            return core + (f" {warn}" if warn else "")
+                core += f"; check: {sec}"
+            if warn:
+                core += f" {warn}"
+            return core + "."
 
-        core = f"讲：{tag or '相关内容'}{warn}；可找：{find_s or '关键定义/方法/实验'}"
+        core = f"本文可找到：{find_s or '关键定义/方法/实验'}"
+        if tag:
+            core += f"（类型：{tag}）"
         if sec:
-            core += f"；建议看：{sec}"
+            core += f"；优先看：{sec}"
+        if warn:
+            core += warn
         return core + "。"
 
     def _brief_ref_line(i: int, h: dict, prompt_text: str) -> tuple[str, str, str, str]:
@@ -3009,16 +3189,16 @@ def _render_refs(
             if w:
                 if en:
                     find_s = ", ".join(find) if find else ""
+                    what = f"This paper explains {w}; you can find {find_s or 'definitions/method/experiments'}"
                     if sec:
-                        what = f"What: {w}; Find: {find_s or 'definitions/method/experiments'}; See: {sec}."
-                    else:
-                        what = f"What: {w}; Find: {find_s or 'definitions/method/experiments'}."
+                        what += f"; check: {sec}"
+                    what += "."
                 else:
                     find_s = "、".join(find) if find else ""
+                    what = f"这篇主要讲：{w}；文中可找到：{find_s or '关键定义/方法/实验'}"
                     if sec:
-                        what = f"讲：{w}；可找：{find_s or '关键定义/方法/实验'}；建议看：{sec}。"
-                    else:
-                        what = f"讲：{w}；可找：{find_s or '关键定义/方法/实验'}。"
+                        what += f"；优先看：{sec}"
+                    what += "。"
 
         if not what:
             what = _ref_one_liner_no_llm(meta, prompt_text, fallback_heading=top)
@@ -3052,6 +3232,141 @@ def _render_refs(
             if p and p.exists():
                 return p
         return None
+
+    def _split_snippet_sentences(text: str) -> list[str]:
+        raw = _clean_snippet_for_display(text or "", max_chars=1400)
+        if not raw:
+            return []
+        # Keep punctuation while splitting Chinese/English sentences.
+        parts = re.split(r"(?<=[。！？!?；;])\s*|(?<=\.)\s+(?=[A-Z0-9])|\n+", raw)
+        out: list[str] = []
+        for p in parts:
+            s = " ".join((p or "").strip().split())
+            if not s:
+                continue
+            if _is_noise_snippet_text(s):
+                continue
+            has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in s)
+            if (not has_cjk) and len(s) < 16:
+                continue
+            if has_cjk and len(s) < 8:
+                continue
+            out.append(s)
+        if out:
+            return out[:28]
+        fallback = " ".join(raw.split())
+        return [fallback] if fallback else []
+
+    def _pick_best_support_sentence(prompt_text: str, meta_h: dict, hit_text: str) -> tuple[str, list[str]]:
+        q = (prompt_text or "").strip()
+        # Highlight terms: query phrases + useful tokens.
+        terms: list[str] = []
+        seen_terms: set[str] = set()
+        for x in (_extract_keywords_for_desc(q, max_n=6) + tokenize(q)):
+            t = " ".join(str(x or "").strip().split())
+            if not t:
+                continue
+            has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in t)
+            if has_cjk:
+                if len(t) < 2:
+                    continue
+            else:
+                if len(t) < 3:
+                    continue
+            k = _norm_text_for_match(t)
+            if not k or k in seen_terms:
+                continue
+            seen_terms.add(k)
+            terms.append(t)
+            if len(terms) >= 10:
+                break
+
+        q_tokens = [t for t in tokenize(q) if (len(t) >= 3) or any("\u4e00" <= ch <= "\u9fff" for ch in t)]
+        snippets: list[str] = []
+        for key in ("ref_show_snippets", "ref_snippets"):
+            arr = meta_h.get(key) or []
+            if isinstance(arr, list):
+                for item in arr[:3]:
+                    s = str(item or "").strip()
+                    if s:
+                        snippets.append(s)
+        t0 = (hit_text or "").strip()
+        if t0:
+            snippets.append(t0)
+
+        cands: list[str] = []
+        seen_sent: set[str] = set()
+        for s in snippets:
+            for sent in _split_snippet_sentences(s):
+                if sent in seen_sent:
+                    continue
+                seen_sent.add(sent)
+                cands.append(sent)
+                if len(cands) >= 36:
+                    break
+            if len(cands) >= 36:
+                break
+        if not cands:
+            return ("", terms)
+
+        term_norms = [_norm_text_for_match(t) for t in terms if t]
+        best_score = -1e9
+        best_sent = cands[0]
+        for idx, sent in enumerate(cands):
+            sc = _score_tokens(sent, q_tokens) if q_tokens else 0.0
+            low = _norm_text_for_match(sent)
+            for kk in term_norms:
+                if kk and (kk in low):
+                    sc += 1.6
+            if 32 <= len(sent) <= 220:
+                sc += 0.8
+            elif len(sent) > 320:
+                sc -= 0.8
+            elif len(sent) < 14:
+                sc -= 1.2
+            sc += max(0.0, 0.22 - (0.015 * idx))
+            if sc > best_score:
+                best_score = sc
+                best_sent = sent
+        return (best_sent, terms)
+
+    def _highlight_sentence_html(sentence: str, terms: list[str]) -> str:
+        txt = (sentence or "").strip()
+        if not txt:
+            return ""
+        spans: list[tuple[int, int]] = []
+        for term in terms or []:
+            t = " ".join(str(term or "").strip().split())
+            if not t:
+                continue
+            has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in t)
+            if (not has_cjk and len(t) < 3) or (has_cjk and len(t) < 2):
+                continue
+            flags = re.I if re.search(r"[A-Za-z]", t) else 0
+            try:
+                for m in re.finditer(re.escape(t), txt, flags=flags):
+                    spans.append((m.start(), m.end()))
+            except Exception:
+                continue
+        if not spans:
+            return html.escape(txt)
+
+        spans.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+        merged: list[list[int]] = []
+        for s, e in spans:
+            if not merged or s > merged[-1][1]:
+                merged.append([s, e])
+            elif e > merged[-1][1]:
+                merged[-1][1] = e
+
+        out: list[str] = []
+        last = 0
+        for s, e in merged:
+            out.append(html.escape(txt[last:s]))
+            out.append(f"<mark>{html.escape(txt[s:e])}</mark>")
+            last = e
+        out.append(html.escape(txt[last:]))
+        return "".join(out)
 
     # Default: show 3, and allow expanding for the rest.
     head = hits[:3]
@@ -3098,6 +3413,16 @@ def _render_refs(
                             st.caption("定位建议：" + " | ".join(hs[:3]))
                     show_key = f"{key_ns}_show_snip_{p_sig}_{i}_{uid}"
                     if st.checkbox("显示命中片段（纯文本）", value=False, key=show_key):
+                        best_sent, hl_terms = _pick_best_support_sentence(prompt, meta_h, str(h.get("text") or ""))
+                        if best_sent:
+                            st.markdown(
+                                "<div class='snipquote'>"
+                                "<div class='snipquote-title'>本次回答最相关原句（命中你问题关键词）</div>"
+                                f"<div class='snipquote-body'>{_highlight_sentence_html(best_sent, hl_terms)}</div>"
+                                "</div>",
+                                unsafe_allow_html=True,
+                            )
+                            st.caption("下面是该命中片段全文，便于核对上下文。")
                         snips = meta_h.get("ref_show_snippets") or []
                         if isinstance(snips, list) and snips:
                             for s in snips[:2]:
@@ -3289,18 +3614,6 @@ def _render_refs_inline(prompt: str, retriever: BM25Retriever, top_k: int, setti
         with st.expander(S["refs"], expanded=False):
             if used_translation:
                 st.caption("（已将中文问题转换为英文检索关键词后再检索。）")
-            # Optional transparency: show the rank signals when debugging ranking.
-            if bool(st.session_state.get("debug_rank")) and used_query:
-                st.caption(f"rank debug: query={used_query}")
-        if bool(st.session_state.get("debug_rank")) and hits:
-            try:
-                r0 = (hits[0].get("meta", {}) or {}).get("ref_rank") or {}
-                st.caption(
-                    "rank debug: top1="
-                    + f"llm={r0.get('llm','')}, deep={r0.get('deep','')}, bm25={r0.get('bm25','')}, bonus={r0.get('term_bonus','')}"
-                )
-            except Exception:
-                pass
         _render_refs(hits, prompt=prompt, show_heading=False, key_ns=f"{key_ns}_refs", settings=settings)
 
 
@@ -3360,8 +3673,6 @@ def _render_refs_panel(prompt: str | None, retriever: BM25Retriever, top_k: int,
 
         if used_translation:
             st.caption("（已将中文问题转换为英文检索关键词后再检索。）")
-        if bool(st.session_state.get("debug_rank")) and used_query:
-            st.caption(f"rank debug: query={used_query}")
         _render_refs(hits, prompt=prompt, show_heading=False, key_ns=key_ns, settings=settings)
 
 
@@ -3557,14 +3868,15 @@ def _page_chat(
 ) -> None:
     st.subheader(S["chat"])
     _inject_copy_js()
-    _qa_ensure_started()
 
     retriever_err = str(st.session_state.get("retriever_load_error") or "").strip()
     if retriever_err:
         st.error(f"\u77e5\u8bc6\u5e93\u52a0\u8f7d\u5931\u8d25\uff1a{retriever_err}")
+
     if "session_id" not in st.session_state:
         st.session_state["session_id"] = uuid.uuid4().hex[:10]
     session_id = str(st.session_state.get("session_id") or "").strip()
+
     conv_id = str(st.session_state.get("conv_id") or "").strip()
     st.session_state["show_context"] = bool(show_context)
     st.session_state["deep_read"] = bool(deep_read)
@@ -3572,514 +3884,287 @@ def _page_chat(
     if bool(getattr(retriever, "is_empty", False)):
         _render_kb_empty_hint()
 
-    # Legacy sync path used 'pending_prompt'. We keep the variable for the early-return guard below,
-    # but the new chat pipeline uses the background answer queue instead.
-    st.session_state["pending_prompt"] = ""
-    prompt_to_answer = ""
+    cur_task = _gen_get_task(session_id)
+    running_for_conv = bool(
+        isinstance(cur_task, dict)
+        and str(cur_task.get("status") or "") == "running"
+        and str(cur_task.get("conv_id") or "") == conv_id
+    )
 
-    msgs = st.session_state.get("messages") or []
-    try:
-        refs_by_user = chat_store.list_message_refs(conv_id)
-    except Exception:
+    st.session_state["pending_prompt"] = ""
+
+    # During streaming reruns, avoid repeated full DB reads to keep UI smooth.
+    msgs_cache_conv = str(st.session_state.get("_chat_msgs_cache_conv") or "")
+    need_refresh_msgs = (
+        (not running_for_conv)
+        or (msgs_cache_conv != conv_id)
+        or (not isinstance(st.session_state.get("messages"), list))
+    )
+    if need_refresh_msgs:
+        try:
+            st.session_state["messages"] = chat_store.get_messages(conv_id)
+        except Exception:
+            st.session_state["messages"] = []
+        st.session_state["_chat_msgs_cache_conv"] = conv_id
+    msgs = list(st.session_state.get("messages") or [])
+
+    refs_cache_conv = str(st.session_state.get("_chat_refs_cache_conv") or "")
+    need_refresh_refs = (
+        (not running_for_conv)
+        or (refs_cache_conv != conv_id)
+        or (not isinstance(st.session_state.get("_chat_refs_cache"), dict))
+    )
+    if need_refresh_refs:
+        try:
+            st.session_state["_chat_refs_cache"] = chat_store.list_message_refs(conv_id) or {}
+        except Exception:
+            st.session_state["_chat_refs_cache"] = {}
+        st.session_state["_chat_refs_cache_conv"] = conv_id
+    refs_by_user = st.session_state.get("_chat_refs_cache") or {}
+    if not isinstance(refs_by_user, dict):
         refs_by_user = {}
-    last_role = str((msgs[-1] or {}).get("role") or "") if msgs else ""
-    # Track "awaiting answer" so the UI doesn't look stuck when the background worker finishes quickly.
-    await_sig_state = str(st.session_state.get("await_prompt_sig") or "").strip()
-    try:
-        await_ts_state = float(st.session_state.get("await_prompt_ts") or 0.0)
-    except Exception:
-        await_ts_state = 0.0
-    if not msgs:
-        st.caption(S["no_msgs"])
+
+    def _render_refs_for_user(user_msg_id: int, prompt_text: str, *, pending: bool = False) -> None:
+        ref_pack = refs_by_user.get(user_msg_id) if isinstance(refs_by_user, dict) else None
+        hits_hist: list[dict] = []
+        prompt_hist = str(prompt_text or "").strip()
+        if isinstance(ref_pack, dict):
+            hits_hist = list(ref_pack.get("hits") or [])
+            p2 = str(ref_pack.get("prompt") or "").strip()
+            if p2:
+                prompt_hist = p2
+
+        with st.container():
+            st.markdown("<div class='msg-refs'>", unsafe_allow_html=True)
+            p_sig_hist = hashlib.sha1(prompt_hist.encode("utf-8", "ignore")).hexdigest()[:8] if prompt_hist else f"msg{user_msg_id}"
+            open_key_hist = f"hist_{conv_id}_{user_msg_id}_refs_open_{p_sig_hist}"
+            with st.expander(S["refs"], expanded=bool(st.session_state.get(open_key_hist) or False)):
+                if hits_hist:
+                    _render_refs(
+                        hits_hist,
+                        prompt=prompt_hist,
+                        show_heading=False,
+                        key_ns=f"hist_{conv_id}_{user_msg_id}",
+                        settings=settings,
+                    )
+                elif pending:
+                    st.caption("（参考定位生成中…）")
+                else:
+                    st.caption("（未命中知识库片段：这条回答没有可定位的参考位置。）")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if (not msgs) and (not running_for_conv):
+        st.markdown(f"<div class='chat-empty-state'>{html.escape(S['no_msgs'])}</div>", unsafe_allow_html=True)
     else:
+        render_msgs = list(msgs)
+        hidden_msgs = 0
+        if running_for_conv:
+            live_window = 20
+            if len(render_msgs) > live_window:
+                hidden_msgs = len(render_msgs) - live_window
+                render_msgs = render_msgs[-live_window:]
+            if hidden_msgs > 0:
+                st.caption(f"（为保证流式输出流畅，已折叠更早的 {hidden_msgs} 条消息）")
+
         last_user_for_refs = None
         last_user_msg_id = 0
         shown_refs_user_ids: set[int] = set()
-        for idx, m in enumerate(msgs):
+        idx_offset = max(0, len(msgs) - len(render_msgs))
+        for idx, m in enumerate(render_msgs, start=idx_offset):
             role = m.get("role", "user")
             content = m.get("content", "") or ""
             try:
                 msg_id = int(m.get("id") or 0)
             except Exception:
                 msg_id = 0
+
             if role == "user":
                 st.markdown("<div class='msg-meta'>你</div>", unsafe_allow_html=True)
-                # Avoid empty HTML wrappers (they render as ugly blue bars). Plain text is enough for user messages.
                 safe = html.escape(content).replace("\n", "<br/>")
                 st.markdown(f"<div class='msg-user'>{safe}</div>", unsafe_allow_html=True)
                 last_user_for_refs = content
                 if msg_id > 0:
                     last_user_msg_id = msg_id
             else:
-                st.markdown("<div class='msg-meta'>AI</div>", unsafe_allow_html=True)
-                # Copy tools + markdown (no extra white box wrapper).
-                msg_key = hashlib.md5((st.session_state.get("conv_id","") + "|" + str(idx)).encode("utf-8","ignore")).hexdigest()[:10]
-                _render_answer_copy_bar(content, key_ns=f"copy_{msg_key}")
-                notice, body = _split_kb_miss_notice(content or "")
-                if notice:
-                    st.markdown(f"<div class='kb-notice'>{html.escape(notice)}</div>", unsafe_allow_html=True)
-                if (body or "").strip():
-                    st.markdown(_normalize_math_markdown(body))
-                if (last_user_msg_id > 0) and (last_user_msg_id not in shown_refs_user_ids):
-                    ref_pack = refs_by_user.get(last_user_msg_id) if isinstance(refs_by_user, dict) else None
-                    hits_hist = []
-                    prompt_hist = str(last_user_for_refs or "").strip()
-                    if isinstance(ref_pack, dict):
-                        hits_hist = list(ref_pack.get("hits") or [])
-                        if str(ref_pack.get("prompt") or "").strip():
-                            prompt_hist = str(ref_pack.get("prompt") or "").strip()
-                    with st.container():
-                        st.markdown("<div class='msg-refs'>", unsafe_allow_html=True)
-                        p_sig_hist = hashlib.sha1(prompt_hist.encode("utf-8", "ignore")).hexdigest()[:8] if prompt_hist else f"msg{last_user_msg_id}"
-                        open_key_hist = f"hist_{conv_id}_{last_user_msg_id}_refs_open_{p_sig_hist}"
-                        with st.expander(S["refs"], expanded=bool(st.session_state.get(open_key_hist) or False)):
-                            if hits_hist:
-                                _render_refs(
-                                    hits_hist,
-                                    prompt=prompt_hist,
-                                    show_heading=False,
-                                    key_ns=f"hist_{conv_id}_{last_user_msg_id}",
-                                    settings=settings,
-                                )
+                pending = False
+                if _is_live_assistant_text(content):
+                    pending_tid = _live_assistant_task_id(content)
+                    t0 = _gen_get_task(session_id)
+                    if isinstance(t0, dict) and str(t0.get("id") or "") == pending_tid:
+                        pending = str(t0.get("status") or "") == "running"
+                        stage = str(t0.get("stage") or "-")
+                        if pending:
+                            st.markdown("<div class='msg-meta'>AI（生成中）</div>", unsafe_allow_html=True)
+                            partial = str(t0.get("partial") or "").strip()
+                            notice, body = _split_kb_miss_notice(partial)
+                            if notice:
+                                st.markdown(f"<div class='kb-notice'>{html.escape(notice)}</div>", unsafe_allow_html=True)
+                            if (body or "").strip():
+                                st.markdown(_normalize_math_markdown(body))
                             else:
-                                st.caption("（未命中知识库片段：这条回答没有可定位的参考位置。）")
-                        st.markdown("</div>", unsafe_allow_html=True)
+                                st.caption("（生成中…）")
+                            st.caption(f"阶段：{stage}")
+                        else:
+                            ans0 = str(t0.get("answer") or "").strip()
+                            if ans0:
+                                st.markdown("<div class='msg-meta'>AI</div>", unsafe_allow_html=True)
+                                _render_answer_copy_bar(ans0, key_ns=f"copy_{idx}_done")
+                                notice, body = _split_kb_miss_notice(ans0)
+                                if notice:
+                                    st.markdown(f"<div class='kb-notice'>{html.escape(notice)}</div>", unsafe_allow_html=True)
+                                if (body or "").strip():
+                                    st.markdown(_normalize_math_markdown(body))
+                            else:
+                                st.markdown("<div class='msg-meta'>AI（处理中）</div>", unsafe_allow_html=True)
+                                st.caption("处理中…")
+                    else:
+                        st.markdown("<div class='msg-meta'>AI（处理中）</div>", unsafe_allow_html=True)
+                        st.caption("处理中…")
+                else:
+                    st.markdown("<div class='msg-meta'>AI</div>", unsafe_allow_html=True)
+                    msg_key = hashlib.md5((st.session_state.get("conv_id", "") + "|" + str(idx)).encode("utf-8", "ignore")).hexdigest()[:10]
+                    _render_answer_copy_bar(content, key_ns=f"copy_{msg_key}")
+                    notice, body = _split_kb_miss_notice(content or "")
+                    if notice:
+                        st.markdown(f"<div class='kb-notice'>{html.escape(notice)}</div>", unsafe_allow_html=True)
+                    if (body or "").strip():
+                        st.markdown(_normalize_math_markdown(body))
+
+                if (last_user_msg_id > 0) and (last_user_msg_id not in shown_refs_user_ids):
+                    _render_refs_for_user(last_user_msg_id, str(last_user_for_refs or "").strip(), pending=pending)
                     shown_refs_user_ids.add(last_user_msg_id)
             st.markdown("")
 
-    # Clear awaiting flag once we have an assistant reply.
-    if last_role == "assistant":
-        st.session_state.pop("await_prompt_sig", None)
-        st.session_state.pop("await_prompt_ts", None)
-
-    # References should stay above the input box.
-    # Always render for the latest user question (even if the last message isn't assistant yet),
-    # otherwise Streamlit rerun timing can make it "disappear".
-    last_user = None
-    for m in reversed(msgs):
-        if m.get("role") == "user":
-            last_user = (m.get("content") or "").strip()
-            break
-    last_user_sig = hashlib.sha1(last_user.encode("utf-8", "ignore")).hexdigest()[:12] if last_user else ""
-    awaiting_recent = bool(last_role == "user" and last_user_sig and (await_sig_state == last_user_sig) and (time.time() - float(await_ts_state or 0.0) < 600.0))
-    refs_slot = st.empty()
-    refs_key_ns = f"latest_{st.session_state.get('conv_id','')}"
-    with refs_slot.container():
-        if last_user:
-            show_live_refs = bool(awaiting_recent)
-            # Sync refs cache from background QA results (so refs won't "disappear" across reruns).
-            try:
-                # Do not scope by session_id here: a browser rerun can reset session_id,
-                # but refs should still sync by conv_id + prompt_sig.
-                qa = _qa_snapshot()
-                prompt_sig = hashlib.sha1(last_user.encode("utf-8", "ignore")).hexdigest()[:12]
-                cand = None
-                cur = qa.get("current") or {}
-                if isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id and str(cur.get("prompt_sig") or "") == prompt_sig:
-                    cand = cur
-                    show_live_refs = True
-                else:
-                    for t in reversed(list(qa.get("recent") or [])):
-                        if not isinstance(t, dict):
-                            continue
-                        if str(t.get("conv_id") or "") == conv_id and str(t.get("prompt_sig") or "") == prompt_sig:
-                            cand = t
-                            break
-                if isinstance(cand, dict):
-                    cache2 = st.session_state.setdefault("refs_cache2", {})
-                    ck = _refs_cache2_key(last_user, top_k=top_k, settings=settings)
-                    if bool(cand.get("refs_done")):
-                        cache2[ck] = {
-                            "hits": cand.get("refs_hits") or [],
-                            "scores": cand.get("refs_scores") or [],
-                            "used_query": str(cand.get("used_query") or "").strip(),
-                            "used_translation": bool(cand.get("used_translation") or False),
-                            "done": True,
-                            "computed_at": float(cand.get("started_at") or time.time()),
-                        }
-                    else:
-                        cache2[ck] = {
-                            "hits": cand.get("refs_hits") or [],
-                            "scores": cand.get("refs_scores") or [],
-                            "used_query": str(cand.get("used_query") or "").strip(),
-                            "used_translation": bool(cand.get("used_translation") or False),
-                            "done": False,
-                            "computed_at": float(cand.get("started_at") or time.time()),
-                        }
-                # Show an always-visible progress hint even when the expander is collapsed.
-                has_task = bool(isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id and str(cur.get("prompt_sig") or "") == prompt_sig)
-                if (has_task and (not bool(cur.get("refs_done")))) or awaiting_recent:
-                    stage_now = ""
-                    hits_now = 0
-                    wait_s = 0.0
-                    try:
-                        if isinstance(cur, dict):
-                            stage_now = str(cur.get("stage") or "").strip()
-                            hits_now = int(cur.get("hits_count") or 0)
-                            wait_s = _elapsed_task_sec(cur)
-                    except Exception:
-                        stage_now = ""
-                        hits_now = 0
-                        wait_s = 0.0
-                    if (wait_s <= 0.0) and await_sig_state and (await_sig_state == prompt_sig):
-                        try:
-                            wait_s = max(0.0, time.time() - float(await_ts_state or 0.0))
-                        except Exception:
-                            wait_s = 0.0
-                    msg = f"参考定位：生成中…（阶段：{stage_now or '-'}"
-                    if hits_now > 0:
-                        msg += f"，候选片段：{hits_now}"
-                    msg += f"，已等待：{wait_s:.0f}s）"
-                    st.markdown(f"<div class='refbox'>{html.escape(msg)}</div>", unsafe_allow_html=True)
-            except Exception:
-                pass
-            if show_live_refs:
-                _render_refs_panel(last_user, retriever, top_k=top_k, settings=settings, key_ns=refs_key_ns)
-
-    # "Thinking / generation" should appear BEFORE the input box. We'll update these placeholders later.
-    gen_panel = st.empty()
-    gen_details_panel = st.empty()
-
-    # Answer queue + stop button + partial output (non-blocking; background worker does the heavy work).
-    # Do not filter by session_id here: reruns/reloads can change Streamlit session id.
-    qa = _qa_snapshot()
-    cur = qa.get("current") or None
-    all_q_items = list(qa.get("queue") or [])
-    q_items = [t for t in all_q_items if isinstance(t, dict) and str(t.get("conv_id") or "") == conv_id]
-    running_this = isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id and str(cur.get("status") or "") == "running"
-    running_any = isinstance(cur, dict) and str(cur.get("status") or "") == "running"
-    has_any_for_conv = False
-    try:
-        if isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id:
-            has_any_for_conv = True
-        if not has_any_for_conv:
-            for t in q_items:
-                if isinstance(t, dict) and str(t.get("conv_id") or "") == conv_id:
-                    has_any_for_conv = True
-                    break
-    except Exception:
-        has_any_for_conv = False
-    awaiting = bool(last_role == "user" and last_user_sig and (has_any_for_conv or awaiting_recent))
-    try:
-        pending_wait_flag = bool(
-            last_role == "user"
-            and await_sig_state
-            and (await_sig_state == last_user_sig)
-            and float(await_ts_state or 0.0) > 0.0
-            and (time.time() - float(await_ts_state or 0.0) < 180.0)
-        )
-    except Exception:
-        pending_wait_flag = False
-    # Hard pending fallback: if the latest message is still user, keep polling briefly
-    # even when queue snapshot is transiently empty. Bound this window to avoid
-    # runaway reruns for very old/stale requests.
-    try:
-        hard_pending = bool(
-            last_role == "user"
-            and last_user_sig
-            and float(await_ts_state or 0.0) > 0.0
-            and (time.time() - float(await_ts_state or 0.0) < 180.0)
-        )
-    except Exception:
-        hard_pending = False
-    try:
-        await_elapsed = max(0.0, time.time() - float(await_ts_state or 0.0))
-    except Exception:
-        await_elapsed = 0.0
-
-    def _elapsed_task_sec(task_obj: dict | None) -> float:
-        try:
-            if isinstance(task_obj, dict):
-                start = float(task_obj.get("started_at") or task_obj.get("created_at") or 0.0)
-                if start > 0:
-                    return max(0.0, time.time() - start)
-        except Exception:
-            pass
-        return float(await_elapsed)
-
-    with gen_details_panel.container():
-        pass
-
-    if running_this and isinstance(cur, dict):
-        with gen_panel.container():
-            c_stop = st.columns([1.6, 10.4])
-            with c_stop[0]:
-                if st.button("停止生成", key="qa_stop_btn_inline"):
-                    _qa_cancel(str(cur.get("id") or ""))
-                    st.experimental_rerun()
-            with c_stop[1]:
-                st.caption("生成中…你可以继续输入新问题，它会进入队列。")
-
-            st.markdown("<div class='msg-meta'>AI（生成中）</div>", unsafe_allow_html=True)
-            partial = str(cur.get("partial") or "").strip()
-            notice, body = _split_kb_miss_notice(partial)
-            if notice:
-                st.markdown(f"<div class='kb-notice'>{html.escape(notice)}</div>", unsafe_allow_html=True)
-            if (body or "").strip():
-                st.markdown(_normalize_math_markdown(body))
-            else:
-                st.caption("（生成中…）")
-    elif running_any and isinstance(cur, dict):
-        # There's a running task in this browser session, but it's not for this conversation.
-        with gen_panel.container():
-            st.markdown("<div class='msg-meta'>AI（后台处理中）</div>", unsafe_allow_html=True)
-            st.caption("正在回答另一个对话的问题…你可以在“回答队列”里停止当前任务。")
-    elif awaiting:
-        # If the worker finishes *very* fast, Streamlit might not rerun and the assistant message won't show.
-        # Keep a short-lived auto refresh so the UI updates.
-        with gen_panel.container():
-            st.markdown("<div class='msg-meta'>AI（处理中）</div>", unsafe_allow_html=True)
-            stage_txt = ""
-            wait_s = 0.0
-            if isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id:
-                stage_txt = str(cur.get("stage") or "").strip()
-                if str(cur.get("status") or "").strip():
-                    stage_txt = (stage_txt + f" / {str(cur.get('status') or '').strip()}").strip(" /")
-                wait_s = _elapsed_task_sec(cur)
-            if (wait_s <= 0.0) and bool(pending_wait_flag):
-                wait_s = float(await_elapsed)
-            st.caption(f"正在检索/阅读知识库…{('（阶段：' + stage_txt + '）') if stage_txt else ''}{(f' 已等待 {wait_s:.0f}s') if wait_s > 0 else ''}")
-            if wait_s >= 18.0:
-                st.warning("当前问题耗时较长。你可以继续提问（进入队列），或点击“停止”后重试更短的问题。")
-
-    # Auto refresh while running/queued/awaiting so the UI doesn't look "stuck" without manual clicks.
-    active_poll = bool(running_any) or bool(q_items) or bool(awaiting) or bool(pending_wait_flag) or bool(hard_pending)
-    if active_poll:
-        components.html(
-            """
-<script>
-(function () {
-  try {
-    const root = window.parent || window.top || window;
-    if (!root) return;
-    if (root._kbQaAutoRefreshInterval) return;
-    root._kbQaAutoRefreshInterval = setInterval(function () {
-      try {
-        const msg = { isStreamlitMessage: true, type: "streamlit:rerunScript" };
-        root.postMessage(msg, "*");
-        if (window.top && window.top !== root) window.top.postMessage(msg, "*");
-        if (window.parent && window.parent !== root) window.parent.postMessage(msg, "*");
-      } catch (e) {}
-    }, 240);
-  } catch (e) {}
-})();
-</script>
-            """,
-            height=0,
-        )
-    else:
-        # Ensure the interval is cleared when idle; avoid unnecessary reruns.
-        components.html(
-            """
-<script>
-(function () {
-  try {
-    const root = window.parent || window.top || window;
-    if (!root) return;
-    if (root._kbQaAutoRefreshInterval) {
-      clearInterval(root._kbQaAutoRefreshInterval);
-      root._kbQaAutoRefreshInterval = null;
-    }
-  } catch (e) {}
-})();
-</script>
-            """,
-            height=0,
-        )
-
-    # Keep polling non-blocking here; do not call server-side rerun before rendering input widgets.
-
     st.markdown("<div style='height:0.35rem;'></div>", unsafe_allow_html=True)
 
-    if "pending_prompt" not in st.session_state:
-        st.session_state["pending_prompt"] = ""
-
-    # Inline queue controls, attached to the composer area (ChatGPT/Codex-like).
-    if running_any or q_items or awaiting:
-        with st.container():
-            st.markdown("<div class='queue-inline-head'>队列</div>", unsafe_allow_html=True)
-            if running_any and isinstance(cur, dict):
-                stage = str(cur.get("stage") or "").strip()
-                char_count = int(cur.get("char_count") or 0)
-                elapsed = _elapsed_task_sec(cur)
-                if (elapsed <= 0.0) and bool(pending_wait_flag):
-                    elapsed = float(await_elapsed)
-                ptxt = str(cur.get("prompt") or "")
-                ptxt_s = (ptxt[:56] + "…") if len(ptxt) > 56 else ptxt
-                other = ""
-                try:
-                    other = "（其他对话）" if str(cur.get("conv_id") or "") != conv_id else ""
-                except Exception:
-                    other = ""
-                st.markdown(
-                    f"<div class='queue-inline-hint'>当前{html.escape(other)}：{html.escape(ptxt_s)} | 阶段：{html.escape(stage or '-')} | 已等待：{elapsed:.0f}s | 已生成：{char_count}</div>",
-                    unsafe_allow_html=True,
-                )
-                c0 = st.columns([1.2, 1.6, 9.2])
-                with c0[0]:
-                    if st.button("停止", key="qa_stop_btn_comp", help="停止当前回答生成"):
-                        _qa_cancel(str(cur.get("id") or ""))
-                        st.experimental_rerun()
-                with c0[1]:
-                    if st.button("清空队列", key="qa_clear_btn_comp", help="清空未开始的回答队列"):
-                        for tq in list(all_q_items):
-                            try:
-                                if str((tq or {}).get("session_id") or "") != session_id:
-                                    continue
-                                umid = int((tq or {}).get("user_msg_id") or 0)
-                                if umid > 0:
-                                    chat_store.delete_message(umid)
-                            except Exception:
-                                pass
-                        _qa_cancel_all(session_id=session_id)
-                        st.session_state["messages"] = chat_store.get_messages(conv_id)
-                        st.experimental_rerun()
-            elif awaiting and last_user:
-                last_note = str(qa.get("last") or "").strip()
-                wait_txt = f"{await_elapsed:.0f}s" if await_elapsed > 0 else "0s"
-                st.markdown(
-                    f"<div class='queue-inline-hint'>已提交问题，后台处理中… 已等待：{html.escape(wait_txt)}</div>",
-                    unsafe_allow_html=True,
-                )
-                if last_note:
-                    st.markdown(f"<div class='queue-inline-hint'>状态：{html.escape(last_note)}</div>", unsafe_allow_html=True)
-            elif q_items:
-                c1 = st.columns([1.6, 10.4])
-                with c1[0]:
-                    if st.button("清空队列", key="qa_clear_btn_comp2"):
-                        for tq in list(all_q_items):
-                            try:
-                                if str((tq or {}).get("session_id") or "") != session_id:
-                                    continue
-                                umid = int((tq or {}).get("user_msg_id") or 0)
-                                if umid > 0:
-                                    chat_store.delete_message(umid)
-                            except Exception:
-                                pass
-                        _qa_cancel_all(session_id=session_id)
-                        st.session_state["messages"] = chat_store.get_messages(conv_id)
-                        st.experimental_rerun()
-                with c1[1]:
-                    st.markdown(f"<div class='queue-inline-hint'>队列中共有 {len(q_items)} 条待回答。</div>", unsafe_allow_html=True)
-
-            if q_items:
-                st.markdown("<div class='queue-inline-hint'>待处理问题（可编辑/删除）：</div>", unsafe_allow_html=True)
-                for i, t in enumerate(q_items, start=1):
-                    if not isinstance(t, dict):
-                        continue
-                    pid = str(t.get("id") or "")
-                    ptxt = str(t.get("prompt") or "")
-                    try:
-                        msg_id = int(t.get("user_msg_id") or 0)
-                    except Exception:
-                        msg_id = 0
-                    draft_key = f"qa_edit_draft_{pid}"
-                    if draft_key not in st.session_state:
-                        st.session_state[draft_key] = ptxt
-                    cc = st.columns([0.8, 8.9, 1.4, 1.4])
-                    with cc[0]:
-                        st.caption(f"[{i}]")
-                    with cc[1]:
-                        st.text_input(
-                            " ",
-                            key=draft_key,
-                            placeholder="可编辑队列问题",
-                        )
-                    with cc[2]:
-                        if st.button("保存", key=f"qa_save_comp_{pid}", help="保存队列问题修改"):
-                            new_prompt = str(st.session_state.get(draft_key) or "").strip()
-                            if new_prompt and (new_prompt != ptxt):
-                                if _qa_update_queued(pid, prompt=new_prompt):
-                                    if msg_id > 0:
-                                        chat_store.update_message_content(msg_id, new_prompt)
-                                    st.session_state["messages"] = chat_store.get_messages(conv_id)
-                            st.experimental_rerun()
-                    with cc[3]:
-                        if st.button("删除", key=f"qa_rm_comp_{pid}", help="从队列中移除这条问题"):
-                            _qa_cancel(pid)
-                            if msg_id > 0:
-                                chat_store.delete_message(msg_id)
-                            st.session_state.pop(draft_key, None)
-                            st.session_state["messages"] = chat_store.get_messages(conv_id)
-                            st.experimental_rerun()
-
     with st.form(key="prompt_form", clear_on_submit=True):
-        prompt_val = st.text_area(S["prompt_label"], height=120, key="prompt_text")
-        submitted = st.form_submit_button(S["send"])
+        prompt_val = st.text_area(" ", height=96, key="prompt_text")
+        action_cols = st.columns([8.4, 1.2, 1.2])
+        with action_cols[1]:
+            if running_for_conv:
+                stop_clicked = st.form_submit_button("■", help="停止输出")
+            else:
+                stop_clicked = False
+                st.markdown("<div style='height:2.25rem;'></div>", unsafe_allow_html=True)
+        with action_cols[2]:
+            submitted = st.form_submit_button("↑")
 
-    # Ctrl+Enter to send (works for Streamlit<=1.12 where chat_input isn't available).
-    # We inject JS into the parent document and click the form submit button.
     components.html(
         """
 <script>
 (function () {
   const root = window.parent.document;
-  function findPromptTextarea() {
-    // Try the most stable selectors first.
-    const byTestId = root.querySelector('div[data-testid="stTextArea"] textarea');
-    if (byTestId) return byTestId;
-    const byClass = root.querySelector('.stTextArea textarea');
-    if (byClass) return byClass;
-    // Fallback: last textarea on the page (usually the prompt).
-    const all = root.querySelectorAll('textarea');
-    return all.length ? all[all.length - 1] : null;
+  function findMainContainer() {
+    return root.querySelector('section.main .block-container') || root.querySelector('.block-container');
   }
-  function findSubmitButton(ta) {
-    // Try to stay within the same form/container as the textarea.
-    const scope =
-      (ta && ta.closest('div[data-testid="stForm"]')) ||
-      (ta && ta.closest('form')) ||
-      root.querySelector('div[data-testid="stForm"]') ||
-      root;
-    const btns = scope.querySelectorAll('button');
-    for (const b of btns) {
-      const t = (b.innerText || '').trim();
-      if (t === '发送') return b;
+  function isSendBtnText(t) {
+    return t === '发送' || t === '↑' || t === '■';
+  }
+  function findPromptFormAndTextarea() {
+    const forms = root.querySelectorAll('div[data-testid="stForm"], form');
+    for (const form of forms) {
+      const ta =
+        form.querySelector('div[data-testid="stTextArea"] textarea') ||
+        form.querySelector('.stTextArea textarea') ||
+        form.querySelector('textarea');
+      if (!ta) continue;
+      const btns = form.querySelectorAll('button');
+      let hasSend = false;
+      for (const b of btns) {
+        const t = (b.innerText || '').trim();
+        if (isSendBtnText(t)) {
+          hasSend = true;
+          break;
+        }
+      }
+      if (hasSend) return { form, ta };
     }
-    return null;
+    return { form: null, ta: null };
+  }
+  function placeDock(form) {
+    if (!form) return;
+    const main = findMainContainer();
+    if (!main) {
+      form.classList.remove('kb-dock-positioned');
+      form.style.left = '';
+      form.style.right = '';
+      form.style.width = '';
+      form.style.transform = '';
+      return;
+    }
+    const rect = main.getBoundingClientRect();
+    if (!rect || !isFinite(rect.left) || !isFinite(rect.width) || rect.width < 10) return;
+    form.classList.add('kb-dock-positioned');
+    form.style.left = Math.max(8, Math.floor(rect.left)) + 'px';
+    form.style.right = 'auto';
+    form.style.width = Math.max(320, Math.floor(rect.width)) + 'px';
+    form.style.transform = 'none';
   }
   function hook() {
-    const ta = findPromptTextarea();
+    const hit = findPromptFormAndTextarea();
+    const ta = hit.ta;
+    const form = hit.form;
     if (!ta) return;
-    const form =
-      (ta && ta.closest('div[data-testid="stForm"]')) ||
-      (ta && ta.closest('form'));
     if (form && !form.classList.contains('kb-input-dock')) {
       form.classList.add('kb-input-dock');
     }
+    placeDock(form);
     if (ta.dataset.kbCtrlEnterHooked === "1") return;
     ta.dataset.kbCtrlEnterHooked = "1";
     ta.addEventListener('keydown', function (e) {
       const isCtrlEnter = (e.ctrlKey || e.metaKey) && (e.key === 'Enter');
       if (!isCtrlEnter) return;
       e.preventDefault();
-      const btn = findSubmitButton(ta);
-      if (btn) btn.click();
+      const btns = (form || root).querySelectorAll('button');
+      for (const b of btns) {
+        const t = (b.innerText || '').trim();
+        if (t === '↑') {
+          b.click();
+          break;
+        }
+      }
     }, { capture: true });
   }
   hook();
-  // Streamlit re-renders DOM: keep trying.
-  setInterval(hook, 800);
+  if (!root.body.dataset.kbDockHookTimer) {
+    root.body.dataset.kbDockHookTimer = "1";
+    setInterval(hook, 800);
+  }
 })();
 </script>
         """,
         height=0,
     )
 
+    if stop_clicked:
+        t0 = _gen_get_task(session_id)
+        if isinstance(t0, dict):
+            _gen_mark_cancel(session_id, str(t0.get("id") or ""))
+        st.experimental_rerun()
+
     if submitted:
         txt = (prompt_val or "").strip()
         if txt:
+            t0 = _gen_get_task(session_id)
+            if isinstance(t0, dict) and str(t0.get("status") or "") == "running":
+                st.warning("上一条回答还在生成中，请先停止或等待完成。")
+                return
+
+            task_id = uuid.uuid4().hex[:12]
             try:
                 user_msg_id = int(chat_store.append_message(conv_id, "user", txt) or 0)
             except Exception:
                 user_msg_id = 0
+            try:
+                assistant_msg_id = int(chat_store.append_message(conv_id, "assistant", _live_assistant_text(task_id)) or 0)
+            except Exception:
+                assistant_msg_id = 0
             chat_store.set_title_if_default(conv_id, txt)
             st.session_state["messages"] = chat_store.get_messages(conv_id)
-            st.session_state["await_prompt_sig"] = hashlib.sha1(txt.encode("utf-8", "ignore")).hexdigest()[:12]
-            st.session_state["await_prompt_ts"] = time.time()
-            _qa_enqueue(
+
+            ok = _gen_start_task(
                 {
-                    "id": uuid.uuid4().hex[:12],
+                    "id": task_id,
                     "session_id": session_id,
                     "conv_id": conv_id,
                     "prompt": txt,
@@ -4091,286 +4176,47 @@ def _page_chat(
                     "temperature": float(temperature),
                     "max_tokens": int(max_tokens),
                     "deep_read": bool(deep_read),
-                    "llm_rerank": bool(st.session_state.get("llm_rerank")),
                     "settings_obj": settings,
                     "user_msg_id": int(user_msg_id),
+                    "assistant_msg_id": int(assistant_msg_id),
                 }
             )
-            st.session_state["pending_prompt"] = ""
+            if not ok:
+                chat_store.update_message_content(assistant_msg_id, "（启动生成失败）")
             st.experimental_rerun()
 
-    # Server-side fallback polling (after input widgets are rendered):
-    # keep a self-sustained heartbeat rerun while active polling is needed.
-    # This avoids "must click another button to refresh" when front-end postMessage
-    # refresh is dropped by browser/runtime.
-    if active_poll and (not submitted) and (not prompt_to_answer):
+    # Adaptive server-side polling:
+    # - fast when new tokens arrive
+    # - slower when model is still retrieving/deep-reading (to reduce UI jank)
+    if running_for_conv and (not submitted) and (not stop_clicked):
+        t_live = _gen_get_task(session_id) or {}
+        poll_key = "_gen_poll_state"
+        prev = st.session_state.get(poll_key) or {}
+        prev_tid = str(prev.get("tid") or "")
+        prev_chars = int(prev.get("chars") or 0)
+        prev_stage = str(prev.get("stage") or "")
+
+        cur_tid = str(t_live.get("id") or "")
         try:
-            now = time.time()
-            last_poll = float(st.session_state.get("_qa_server_poll_at") or 0.0)
-            # Running task => tighter cadence for smoother partial output.
-            # Queue-only / pending-only => slightly slower cadence to reduce load.
-            if running_any or running_this:
-                poll_interval = 0.12
-            elif q_items:
-                poll_interval = 0.22
-            else:
-                poll_interval = 0.28
+            cur_chars = int(t_live.get("char_count") or 0)
         except Exception:
-            now = time.time()
-            last_poll = 0.0
-            poll_interval = 0.18
-        remain = float(poll_interval) - max(0.0, now - last_poll)
-        if remain > 0.0:
-            # Sleep a little before rerun so polling is periodic even without JS events.
-            time.sleep(min(remain, float(poll_interval)))
-        st.session_state["_qa_server_poll_at"] = time.time()
+            cur_chars = 0
+        cur_stage = str(t_live.get("stage") or "")
+
+        if cur_tid != prev_tid:
+            delay_s = 0.14
+        elif cur_chars > prev_chars:
+            delay_s = 0.16
+        elif cur_stage != prev_stage:
+            delay_s = 0.22
+        else:
+            delay_s = 0.42
+
+        st.session_state[poll_key] = {"tid": cur_tid, "chars": cur_chars, "stage": cur_stage}
+        time.sleep(delay_s)
         st.experimental_rerun()
-    elif not active_poll:
-        st.session_state["_qa_server_poll_at"] = 0.0
-
-    if not prompt_to_answer:
-        return
-
-    # Retrieve (coarse, for answering)
-    hits_raw, _scores_raw, used_query, used_translation = _search_hits_with_fallback(
-        prompt_to_answer,
-        retriever,
-        top_k=top_k,
-        settings=settings,
-    )
-    hits = _group_hits_by_top_heading(hits_raw, top_k=top_k)
-    # Respect the library: once we have hits, always do an in-doc deep read to refine context.
-    # IMPORTANT: do not flip st.session_state["deep_read"] here, otherwise the refs cache key can change
-    # between reruns and the panel may look like it "disappeared".
-    effective_deep_read = bool(deep_read) or bool(hits)
-
-    # Build & render "参考定位" for this prompt with progress feedback.
-    # This runs AFTER the prompt is already visible, so the page won't look frozen.
-    try:
-        cache2 = st.session_state.setdefault("refs_cache2", {})
-        ck2 = _refs_cache2_key(prompt_to_answer, top_k=top_k, settings=settings)
-        existing = cache2.get(ck2) or {}
-        if not (isinstance(existing, dict) and bool(existing.get("done") or False)):
-            with refs_slot.container():
-                if bool(getattr(retriever, "is_empty", False)):
-                    st.markdown("<div class='refbox'>参考定位：知识库为空（请先在“文献管理”里更新知识库）</div>", unsafe_allow_html=True)
-                    cache2[ck2] = {
-                        "hits": [],
-                        "scores": _scores_raw,
-                        "used_query": used_query,
-                        "used_translation": bool(used_translation),
-                        "done": True,
-                        "computed_at": time.time(),
-                    }
-                else:
-                    # Visible feedback (even when the expander is collapsed).
-                    st.markdown("<div class='refbox'>参考定位：生成中…</div>", unsafe_allow_html=True)
-                    if used_translation:
-                        st.caption("（已将中文问题转换为英文检索关键词后再检索。）")
-
-                    with st.spinner("正在定位参考文献（合并同一篇文献 → 深读少量命中 → 语义重排）..."):
-                        grouped_docs = _group_hits_by_doc_for_refs(
-                            hits_raw,
-                            prompt_text=prompt_to_answer,
-                            top_k_docs=top_k,
-                            deep_query=str(used_query or ""),
-                            deep_read=bool(effective_deep_read),
-                            llm_rerank=bool(st.session_state.get("llm_rerank")),
-                            settings=settings,
-                        )
-
-                    cache2[ck2] = {
-                        "hits": grouped_docs,
-                        "scores": _scores_raw,
-                        "used_query": used_query,
-                        "used_translation": bool(used_translation),
-                        "done": True,
-                        "computed_at": time.time(),
-                    }
-
-                p_sig2 = hashlib.sha1(prompt_to_answer.encode("utf-8", "ignore")).hexdigest()[:8] if prompt_to_answer else "noprompt"
-                open_key2 = f"{refs_key_ns}_refs_open_{p_sig2}"
-                more_key2 = f"{refs_key_ns}_more_{p_sig2}"
-                expanded2 = bool(st.session_state.get(open_key2)) or bool(st.session_state.get(more_key2))
-                with st.expander(S["refs"], expanded=expanded2):
-                    if bool(st.session_state.get("debug_rank")) and used_query:
-                        st.caption(f"rank debug: query={used_query}")
-                    grouped_docs2 = (cache2.get(ck2) or {}).get("hits") or []
-                    if grouped_docs2:
-                        _render_refs(grouped_docs2, prompt=prompt_to_answer, show_heading=False, key_ns=refs_key_ns, settings=settings)
-                    else:
-                        _render_kb_empty_hint(compact=True) if bool(getattr(retriever, "is_empty", False)) else st.caption("（未命中知识库片段：本次问题在知识库中没有找到可定位的原文位置。）")
-    except Exception:
-        # Never fail the main answering flow because refs failed.
-        pass
-
-    # A GPT-like, collapsible "generation details" panel ABOVE the input.
-    # This is NOT chain-of-thought; it's just progress + retrieval stats.
-    def _render_gen_details(stage: str) -> None:
-        # Avoid leaking chain-of-thought: only show observable pipeline status.
-        with gen_details_panel.container():
-            with st.expander("生成过程（可展开）", expanded=False):
-                q_safe = html.escape(prompt_to_answer).replace("\n", "<br/>")
-                st.markdown(f"<div class='genbox'><b>问题</b>：{q_safe}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='genbox'><b>阶段</b>：{html.escape(stage)}</div>", unsafe_allow_html=True)
-                if used_translation and used_query:
-                    st.markdown(f"<div class='genbox'><b>检索</b>：已用英文关键词检索：{html.escape(used_query)}</div>", unsafe_allow_html=True)
-                st.markdown(f"<div class='genbox'><b>检索</b>：命中 {len(hits)} 条（按大标题去重）</div>", unsafe_allow_html=True)
-                if effective_deep_read:
-                    st.markdown("<div class='genbox'><b>深读</b>：已开启（会读取命中文献的原始 .md 做细搜补充定位）</div>", unsafe_allow_html=True)
-                try:
-                    dd = int(st.session_state.get("deep_read_docs", 0) or 0)
-                    da = int(st.session_state.get("deep_read_added", 0) or 0)
-                    if effective_deep_read and (dd or da):
-                        st.markdown(f"<div class='genbox'><b>深读结果</b>：细搜文献 {dd} 篇，补充片段 {da} 段</div>", unsafe_allow_html=True)
-                except Exception:
-                    pass
-                if hits:
-                    st.markdown("<div class='genbox'><b>优先参考</b>：前 3 条</div>", unsafe_allow_html=True)
-                    for i, h in enumerate(hits[:3], start=1):
-                        meta = h.get("meta", {}) or {}
-                        src_name = Path(meta.get("source_path", "") or "").name or "unknown"
-                        top = meta.get("top_heading") or _top_heading(meta.get("heading_path", ""))
-                        top = "" if _is_probably_bad_heading(top) else top
-                        line = f"[{i}] {html.escape(src_name)}" + (f"（{html.escape(top)}）" if top else "")
-                        st.markdown(f"<div class='genbox'>- {line}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div class='genbox'>未命中知识库片段：将基于常识回答，并建议你从相关论文的 References 扩展检索。</div>", unsafe_allow_html=True)
-
-    # Live assistant bubble ABOVE the input (updated during streaming).
-    def _render_partial(text: str, char_count: Optional[int] = None) -> None:
-        safe = (text or "").strip()
-        if not safe:
-            safe = "（生成中…）"
-        with gen_panel.container():
-            st.markdown("<div class='msg-meta'>AI（生成中）</div>", unsafe_allow_html=True)
-            notice, body = _split_kb_miss_notice(safe)
-            if notice:
-                st.markdown(f"<div class='kb-notice'>{html.escape(notice)}</div>", unsafe_allow_html=True)
-            if (body or "").strip():
-                st.markdown(_normalize_math_markdown(body))
-            if char_count is not None:
-                # Render as HTML so it won't show as literal "<div ...>"
-                st.markdown(f"<div class='genbox'>已生成：{char_count} 字符</div>", unsafe_allow_html=True)
-
-    ds = DeepSeekChat(settings)
-    partial = ""
-    messages = []
-    try:
-        _render_gen_details("检索完成 → 组装上下文")
-
-        # Build a compact prompt: coarse hits + fine (deep-read) snippets.
-        ctx_parts: list[str] = []
-        doc_first_idx: dict[str, int] = {}
-        for i, h in enumerate(hits, start=1):
-            meta = h.get("meta", {}) or {}
-            src = (meta.get("source_path", "") or "").strip()
-            if src and src not in doc_first_idx:
-                doc_first_idx[src] = i
-            src_name = Path(src).name if src else ""
-            top = meta.get("top_heading") or _top_heading(meta.get("heading_path", ""))
-            top = "" if _is_probably_bad_heading(top) else top
-            header = f"[{i}] {src_name or 'unknown'}" + (f" | {top}" if top else "")
-            body = h.get("text", "") or ""
-            ctx_parts.append(header + "\n" + body)
-
-        # Deep-read (fine search): read full md of matched docs, pull more relevant snippets.
-        deep_added = 0
-        deep_docs = 0
-        if effective_deep_read and hits:
-            q_fine = (used_query or prompt_to_answer or "").strip()
-            q_alt = (prompt_to_answer or "").strip()
-            items = list(doc_first_idx.items())[:3]
-            total = len(items)
-            for n, (src, idx0) in enumerate(items, start=1):
-                _render_gen_details(f"深读原文中（{n}/{total}） → 组装上下文")
-                p = Path(src)
-                extras: list[dict] = []
-                if q_fine:
-                    extras.extend(_deep_read_md_for_context(p, q_fine, max_snippets=2, snippet_chars=1400))
-                # Also try the original language query (helps when the KB contains Chinese md).
-                if q_alt and q_alt != q_fine:
-                    extras.extend(_deep_read_md_for_context(p, q_alt, max_snippets=1, snippet_chars=1400))
-                if not extras:
-                    continue
-                deep_docs += 1
-                # Deduplicate snippets
-                seen_snip = set()
-                extras2: list[str] = []
-                for ex in sorted(extras, key=lambda x: float(x.get("score", 0.0) or 0.0), reverse=True):
-                    t = (ex.get("text") or "").strip()
-                    if not t:
-                        continue
-                    k = hashlib.sha1(t.encode("utf-8", "ignore")).hexdigest()[:12]
-                    if k in seen_snip:
-                        continue
-                    seen_snip.add(k)
-                    extras2.append(t)
-                    if len(extras2) >= 3:
-                        break
-                if not extras2:
-                    continue
-                try:
-                    base = ctx_parts[idx0 - 1]
-                except Exception:
-                    continue
-                for t in extras2:
-                    if t in base:
-                        continue
-                    base += "\n\n（深读补充定位：来自原文）\n" + t
-                    deep_added += 1
-                ctx_parts[idx0 - 1] = base
-        # Persist observable deep-read stats for the "生成过程" panel (no chain-of-thought).
-        st.session_state["deep_read_docs"] = int(deep_docs)
-        st.session_state["deep_read_added"] = int(deep_added)
-
-        ctx = "\n\n---\n\n".join(ctx_parts)
-
-        system = (
-            "你的名字是 π-zaya。\n"
-            "如果用户问‘你是谁/你叫什么/你是谁开发的’之类的问题，统一回答：我是 P&I Lab 开发的 π-zaya。\n"
-            "你是我的个人知识库助手。优先基于我提供的检索片段回答问题。\n"
-            "规则：\n"
-            "1) 如果检索片段存在：优先基于片段回答；需要引用时，用 [1] [2] 这样的编号标注。\n"
-            "2) 如果检索片段为空：也要给出可用的通用回答，但开头必须写明‘未命中知识库片段’。\n"
-            "3) 不要编造不存在的论文、公式、数据或结论。\n"
-            "4) 不要输出‘参考定位/Top-K/引用列表’之类的额外段落（我会在页面里单独展示）。\n"
-            "5) 数学公式输出格式：短的变量/符号用 $...$（行内）；较长的等式/推导用 $$...$$（行间）。不要用反引号包裹公式。\n"
-        )
-
-        user = f"问题：\n{prompt_to_answer}\n\n检索片段（含深读补充定位）：\n{ctx if ctx else '(无)'}\n"
-
-        history = chat_store.get_messages(st.session_state["conv_id"])
-        hist = [m for m in history if m.get("role") in ("user", "assistant")][-10:]
-        messages = [{"role": "system", "content": system}, *hist, {"role": "user", "content": user}]
-
-        _render_gen_details("上下文就绪 → 生成中")
-        _render_partial("", char_count=0)
-        last_ui = time.monotonic()
-        for piece in ds.chat_stream(messages=messages, temperature=temperature, max_tokens=max_tokens):
-            partial += piece
-            now = time.monotonic()
-            # Streamlit reruns are expensive: update ~5 times/s or on paragraph breaks.
-            if (now - last_ui) >= 0.20 or ("\n\n" in piece):
-                _render_partial(partial, char_count=len(partial))
-                last_ui = now
-        _render_partial(partial, char_count=None)
-        answer = _normalize_math_markdown(_strip_model_ref_section(partial or "")).strip() or "（未返回文本）"
-    except Exception:
-        # Fallback to non-streaming mode
-        _render_gen_details("生成失败 → 尝试普通模式")
-        try:
-            resp = ds.chat(messages=messages, temperature=temperature, max_tokens=max_tokens)
-            answer = _normalize_math_markdown(_strip_model_ref_section(resp or "")).strip()
-        except Exception as e:
-            answer = S["llm_fail"].format(err=str(e))
-
-    chat_store.append_message(st.session_state["conv_id"], "assistant", answer)
-    st.session_state["messages"] = chat_store.get_messages(st.session_state["conv_id"])
-
-    # Render updated chat + refs (refs shown once, under the latest assistant message)
-    st.experimental_rerun()
-
+    else:
+        st.session_state.pop("_gen_poll_state", None)
 
 def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: Path, prefs: dict, retriever_reload_flag: dict) -> None:
     _bg_ensure_started()
@@ -5290,9 +5136,6 @@ def main() -> None:
     if "conv_id" not in st.session_state:
         st.session_state["conv_id"] = chat_store.create_conversation()
 
-    if "debug_rank" not in st.session_state:
-        st.session_state["debug_rank"] = False
-
     if "llm_rerank" not in st.session_state:
         st.session_state["llm_rerank"] = True
 
@@ -5301,11 +5144,6 @@ def main() -> None:
 
     with st.sidebar:
         st.subheader(S["settings"])
-        if bool(st.session_state.get("debug_rank")):
-            try:
-                st.caption(f"app: {Path(__file__).resolve()}")
-            except Exception:
-                pass
 
         # Background conversion status (shown on every page)
         _bg_ensure_started()
@@ -5349,9 +5187,8 @@ def main() -> None:
         max_tokens = st.slider(S["max_tokens"], min_value=256, max_value=4096, value=int(prefs.get("max_tokens") or 1200), step=64)
         show_context = st.checkbox(S["show_ctx"], value=bool(prefs.get("show_context") or False))
         deep_read = st.checkbox(S["deep_read"], value=bool(prefs.get("deep_read") if ("deep_read" in prefs) else True))
-        llm_rerank = st.checkbox(S["llm_rerank"], value=bool(prefs.get("llm_rerank") if ("llm_rerank" in prefs) else True))
-        st.session_state["debug_rank"] = st.checkbox("rank debug", value=bool(st.session_state.get("debug_rank") or False))
-        st.session_state["llm_rerank"] = bool(llm_rerank)
+        llm_rerank = True
+        st.session_state["llm_rerank"] = True
 
         # Persist simple knobs
         prefs_knobs = dict(prefs)
