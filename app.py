@@ -94,46 +94,56 @@ S = {
 
 
 # Background conversion queue so you can switch pages while converting.
-_BG_LOCK = threading.Lock()
-_BG_STATE = {
-    "queue": [],
-    "running": False,
-    "done": 0,
-    "total": 0,
-    "current": "",
-    "cur_page_done": 0,
-    "cur_page_total": 0,
-    "cur_page_msg": "",
-    "cancel": False,
-    "last": "",
-}
-_BG_THREAD: Optional[threading.Thread] = None
+# NOTE: Streamlit re-runs the script from top to bottom; guard globals so background threads
+# keep writing to the same state dict across reruns (otherwise UI reads a new dict and "freezes").
+if "_BG_LOCK" not in globals():
+    _BG_LOCK = threading.Lock()
+if "_BG_STATE" not in globals():
+    _BG_STATE = {
+        "queue": [],
+        "running": False,
+        "done": 0,
+        "total": 0,
+        "current": "",
+        "cur_page_done": 0,
+        "cur_page_total": 0,
+        "cur_page_msg": "",
+        "cancel": False,
+        "last": "",
+    }
+if "_BG_THREAD" not in globals():
+    _BG_THREAD: Optional[threading.Thread] = None
 
 
 # ----------------------
 # Chat answer queue (QA)
 # ----------------------
 
-_QA_LOCK = threading.Lock()
-_QA_STATE: dict = {
-    "queue": [],  # list[dict]
-    "running": False,
-    "current": None,  # dict | None
-    "cancel_id": "",  # current task id to cancel
-    "recent": [],  # last N completed tasks (for refs panel)
-    "last": "",
-}
-_QA_THREAD: Optional[threading.Thread] = None
+if "_QA_LOCK" not in globals():
+    _QA_LOCK = threading.Lock()
+if "_QA_STATE" not in globals():
+    _QA_STATE: dict = {
+        "queue": [],  # list[dict]
+        "running": False,
+        "current": None,  # dict | None
+        "cancel_id": "",  # current task id to cancel
+        "recent": [],  # last N completed tasks (for refs panel)
+        "last": "",
+    }
+if "_QA_THREAD" not in globals():
+    _QA_THREAD: Optional[threading.Thread] = None
 
 
-_CACHE_LOCK = threading.Lock()
-_CACHE: dict[str, dict] = {
-    "file_text": {},
-    "deep_read": {},
-    "trans": {},
-    "rerank": {},
-    "refs_pack": {},
-}
+if "_CACHE_LOCK" not in globals():
+    _CACHE_LOCK = threading.Lock()
+if "_CACHE" not in globals():
+    _CACHE: dict[str, dict] = {
+        "file_text": {},
+        "deep_read": {},
+        "trans": {},
+        "rerank": {},
+        "refs_pack": {},
+    }
 
 
 def _cache_get(bucket: str, key: str):
@@ -3384,6 +3394,7 @@ def _page_chat(
     cur = qa.get("current") or None
     q_items = list(qa.get("queue") or [])
     running_this = isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id and str(cur.get("status") or "") == "running"
+    running_session = isinstance(cur, dict) and str(cur.get("status") or "") == "running"
     has_any_for_conv = False
     try:
         if isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id:
@@ -3399,7 +3410,7 @@ def _page_chat(
 
     with gen_details_panel.container():
         with st.expander("回答队列（可展开）", expanded=running_this or bool(q_items) or awaiting):
-            if running_this and isinstance(cur, dict):
+            if running_session and isinstance(cur, dict):
                 stage = str(cur.get("stage") or "").strip()
                 char_count = int(cur.get("char_count") or 0)
                 c0 = st.columns([1.2, 1.6, 9.2])
@@ -3414,7 +3425,12 @@ def _page_chat(
                 with c0[2]:
                     ptxt = str(cur.get("prompt") or "")
                     ptxt_s = (ptxt[:60] + "…") if len(ptxt) > 60 else ptxt
-                    st.caption(f"当前：{ptxt_s} | 阶段：{stage or '-'} | 已生成：{char_count}")
+                    other = ""
+                    try:
+                        other = "（其他对话）" if str(cur.get("conv_id") or "") != conv_id else ""
+                    except Exception:
+                        other = ""
+                    st.caption(f"当前{other}：{ptxt_s} | 阶段：{stage or '-'} | 已生成：{char_count}")
             elif q_items:
                 c1 = st.columns([1.6, 10.4])
                 with c1[0]:
@@ -3465,8 +3481,20 @@ def _page_chat(
                 st.markdown(_normalize_math_markdown(body))
             else:
                 st.caption("（生成中…）")
+    elif running_session and isinstance(cur, dict):
+        # There's a running task in this browser session, but it's not for this conversation.
+        with gen_panel.container():
+            st.markdown("<div class='msg-meta'>AI（后台处理中）</div>", unsafe_allow_html=True)
+            st.caption("正在回答另一个对话的问题…你可以在“回答队列”里停止当前任务。")
+    elif awaiting:
+        # If the worker finishes *very* fast, Streamlit might not rerun and the assistant message won't show.
+        # Keep a short-lived auto refresh so the UI updates.
+        with gen_panel.container():
+            st.markdown("<div class='msg-meta'>AI（处理中）</div>", unsafe_allow_html=True)
+            st.caption("正在检索/阅读知识库…")
 
-        # Auto refresh while running so partial output updates.
+    # Auto refresh while running/queued/awaiting so the UI doesn't look "stuck" without manual clicks.
+    if bool(running_session) or bool(q_items) or bool(awaiting):
         components.html(
             """
 <script>
@@ -3480,33 +3508,7 @@ def _page_chat(
         root._kbQaAutoRefreshTimer = null;
         root.postMessage({ isStreamlitMessage: true, type: "streamlit:rerunScript" }, "*");
       } catch (e) {}
-    }, 800);
-  } catch (e) {}
-})();
-</script>
-            """,
-            height=0,
-        )
-    elif awaiting:
-        # If the worker finishes *very* fast, Streamlit might not rerun and the assistant message won't show.
-        # Keep a short-lived auto refresh so the UI updates.
-        with gen_panel.container():
-            st.markdown("<div class='msg-meta'>AI（处理中）</div>", unsafe_allow_html=True)
-            st.caption("正在检索/阅读知识库…")
-        components.html(
-            """
-<script>
-(function () {
-  try {
-    const root = window.parent;
-    if (!root) return;
-    if (root._kbQaAwaitTimer) return;
-    root._kbQaAwaitTimer = setTimeout(function () {
-      try {
-        root._kbQaAwaitTimer = null;
-        root.postMessage({ isStreamlitMessage: true, type: "streamlit:rerunScript" }, "*");
-      } catch (e) {}
-    }, 650);
+    }, 700);
   } catch (e) {}
 })();
 </script>
