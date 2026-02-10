@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
@@ -499,6 +502,9 @@ def run_pdf_to_md(
     keep_debug: bool,
     eq_image_fallback: bool,
     progress_cb: Callable[[int, int, str], None] | None = None,
+    cancel_cb: Callable[[], bool] | None = None,
+    heartbeat_s: float = 1.0,
+    stall_timeout_s: float | None = None,
 ) -> tuple[bool, str]:
     """
     Convert a PDF into a markdown folder under out_root/pdf_stem.
@@ -513,6 +519,19 @@ def run_pdf_to_md(
     pdf_path = Path(pdf_path)
     out_root = Path(out_root)
     ensure_dir(out_root)
+    # In no-LLM mode, extracted equations are often garbled. Force image fallback to keep rendering faithful.
+    if bool(no_llm) and (not bool(eq_image_fallback)):
+        eq_image_fallback = True
+
+    if stall_timeout_s is None:
+        try:
+            stall_timeout_s = float(os.environ.get("KB_PDF_PROGRESS_STALL_TIMEOUT_S", "0"))
+        except Exception:
+            stall_timeout_s = 0.0
+    try:
+        heartbeat_s = max(0.25, float(heartbeat_s))
+    except Exception:
+        heartbeat_s = 1.0
 
     def _fallback_convert() -> tuple[bool, str]:
         out_dir = out_root / pdf_path.stem
@@ -528,6 +547,12 @@ def run_pdf_to_md(
         try:
             total_pages = int(getattr(doc, "page_count", 0) or 0)
             for i in range(total_pages):
+                if cancel_cb is not None:
+                    try:
+                        if bool(cancel_cb()):
+                            return False, "cancelled"
+                    except Exception:
+                        pass
                 try:
                     page = doc.load_page(i)
                     txt = (page.get_text("text") or "").strip()
@@ -580,6 +605,24 @@ def run_pdf_to_md(
     if eq_image_fallback:
         args.append("--eq-image-fallback")
 
+    def _terminate_proc(proc: subprocess.Popen) -> None:
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=4)
+        except Exception:
+            pass
+        try:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
+        except Exception:
+            pass
+
     try:
         # Stream stdout so we can parse per-page progress emitted by the converter.
         # Example lines:
@@ -599,37 +642,119 @@ def run_pdf_to_md(
             env=env,
         )
         assert proc.stdout is not None
-        re_pages = re.compile(r"\\bpages\\s*:\\s*(\\d+)\\b", flags=re.IGNORECASE)
-        re_prog = re.compile(r"Processing\\s+page\\s+(\\d+)\\s*/\\s*(\\d+)", flags=re.IGNORECASE)
-        for line in proc.stdout:
-            s = (line or "").rstrip()
-            if s:
-                cp_out.append(s)
-            m1 = re_pages.search(s)
-            if m1:
+        line_q: queue.Queue[Optional[str]] = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                for line in proc.stdout:
+                    line_q.put(line)
+            except Exception:
+                pass
+            finally:
                 try:
-                    p_total = max(p_total, int(m1.group(1)))
+                    line_q.put(None)
                 except Exception:
                     pass
-            m2 = re_prog.search(s)
-            if m2:
+
+        rd = threading.Thread(target=_reader, daemon=True)
+        rd.start()
+
+        re_pages = re.compile(r"\bpages\s*:\s*(\d+)\b", flags=re.IGNORECASE)
+        re_prog = re.compile(r"Processing\s+page\s+(\d+)\s*/\s*(\d+)", flags=re.IGNORECASE)
+        last_line_ts = time.time()
+        last_heartbeat_ts = 0.0
+        rc_override: Optional[int] = None
+        while True:
+            got_line = False
+            line: Optional[str] = None
+            try:
+                line = line_q.get(timeout=0.35)
+                got_line = True
+            except queue.Empty:
+                got_line = False
+
+            if got_line and (line is None):
+                break
+
+            if got_line:
+                s = (line or "").rstrip()
+                if s:
+                    cp_out.append(s)
+                    last_line_ts = time.time()
+                m1 = re_pages.search(s)
+                if m1:
+                    try:
+                        p_total = max(p_total, int(m1.group(1)))
+                    except Exception:
+                        pass
+                m2 = re_prog.search(s)
+                if m2:
+                    try:
+                        p_done = int(m2.group(1))
+                        p_total = max(p_total, int(m2.group(2)))
+                    except Exception:
+                        pass
                 try:
-                    p_done = int(m2.group(1))
-                    p_total = max(p_total, int(m2.group(2)))
+                    progress_cb and progress_cb(p_done, p_total, s)
                 except Exception:
                     pass
-            if progress_cb is not None and p_total > 0:
+
+            now = time.time()
+            if cancel_cb is not None:
                 try:
-                    progress_cb(p_done, p_total, s)
+                    if bool(cancel_cb()):
+                        rc_override = -2
+                        _terminate_proc(proc)
+                        break
                 except Exception:
                     pass
-        rc = int(proc.wait() or 0)
+
+            if (stall_timeout_s is not None) and (stall_timeout_s > 0):
+                try:
+                    if (now - last_line_ts) >= float(stall_timeout_s):
+                        rc_override = -3
+                        _terminate_proc(proc)
+                        break
+                except Exception:
+                    pass
+
+            if (progress_cb is not None) and ((now - last_heartbeat_ts) >= heartbeat_s):
+                last_idle_s = max(0, int(now - last_line_ts))
+                base_msg = (
+                    f"Processing page {p_done}/{p_total} ..."
+                    if p_total > 0
+                    else ("converter running..." if not cp_out else cp_out[-1])
+                )
+                heartbeat_msg = f"{base_msg} (alive {last_idle_s}s)"
+                try:
+                    progress_cb(p_done, p_total, heartbeat_msg)
+                except Exception:
+                    pass
+                last_heartbeat_ts = now
+
+            if (proc.poll() is not None) and line_q.empty():
+                break
+
+        if rc_override is not None:
+            rc = int(rc_override)
+        else:
+            try:
+                rc = int(proc.wait(timeout=8) or 0)
+            except Exception:
+                _terminate_proc(proc)
+                rc = int(proc.wait() or 0)
     except Exception as e:
         # If the external converter is misconfigured on collaborator machines, don't hard-fail.
         ok2, out2 = _fallback_convert()
         if ok2:
             return True, out2
         return False, str(e)
+
+    if rc == -2:
+        return False, "cancelled"
+    if rc == -3:
+        timeout_hint = int(float(stall_timeout_s or 0))
+        return False, f"converter stalled (no output for {timeout_hint}s)"
 
     if rc != 0:
         tail = "\n".join(cp_out).strip()[-800:]

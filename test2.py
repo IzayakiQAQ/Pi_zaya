@@ -267,6 +267,8 @@ class LlmConfig:
     temperature: float = 0.0
     max_tokens: int = 4096
     request_sleep_s: float = 0.0
+    timeout_s: float = 45.0
+    max_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -315,6 +317,64 @@ def _is_letter(ch: str) -> bool:
         return unicodedata.category(ch).startswith("L")
     except Exception:
         return False
+
+
+_NUMBERED_HEADING_RE = re.compile(
+    r"^(?P<num>\d+(?:\.\d+)*)(?:[\.\)]|）)?\s+(?P<rest>.+)$"
+)
+_APPENDIX_HEADING_RE = re.compile(
+    r"^(?P<letter>[A-Z])(?P<suffix>(?:\.\d+)*)\s+(?P<rest>.+)$"
+)
+
+
+def _parse_numbered_heading_level(title: str) -> Optional[int]:
+    t = _normalize_text(title or "").strip()
+    if not t:
+        return None
+    m = _NUMBERED_HEADING_RE.match(t)
+    if not m:
+        return None
+    rest = (m.group("rest") or "").strip()
+    if not rest:
+        return None
+    if not _is_letter(rest[0]):
+        return None
+    if _looks_like_equation_text(rest):
+        return None
+
+    parts = (m.group("num") or "").split(".")
+    if not parts:
+        return None
+    try:
+        first_n = int(parts[0])
+    except Exception:
+        return None
+    # Guard against year-like or DOI-like prefixes being mistaken as headings.
+    if first_n <= 0 or first_n > 200:
+        return None
+    if len(parts) == 1 and len(parts[0]) > 2:
+        return None
+    if any((not p) or len(p) > 2 for p in parts[1:]):
+        return None
+    return len(parts)
+
+
+def _parse_appendix_heading_level(title: str) -> Optional[int]:
+    t = _normalize_text(title or "").strip()
+    if not t:
+        return None
+    if t.upper() == "APPENDIX":
+        return 1
+    m = _APPENDIX_HEADING_RE.match(t)
+    if not m:
+        return None
+    rest = (m.group("rest") or "").strip()
+    if not rest:
+        return None
+    if _looks_like_equation_text(rest):
+        return None
+    suffix = m.group("suffix") or ""
+    return 1 + int(suffix.count("."))
 
 
 def _looks_like_equation_text(s: str) -> bool:
@@ -605,40 +665,36 @@ def detect_header_tag(
     if t.upper() == "APPENDIX" and is_spanning and max_size >= body_size - 0.3:
         return "[H1]"
 
-    if _is_numbered_heading_text(t):
-        m = re.match(r"^(\d+(?:\.\d+)*)\s+(.+)$", t)
-        if m:
-            title = m.group(2).strip()
-            if len(title) <= 140 and not title.endswith(".") and not _looks_like_equation_text(title):
-                level = m.group(1).count(".") + 1
-                level = max(1, min(3, level))
-                # require it's at least body size (avoid footnotes polluting headings)
-                if max_size >= body_size - 0.3:
-                    return f"[H{level}]"
+    numbered_level = _parse_numbered_heading_level(t)
+    if numbered_level is not None:
+        title = t
+        if len(title) <= 140 and not title.endswith("."):
+            level = max(1, min(3, int(numbered_level)))
+            # require it's at least body size (avoid footnotes polluting headings)
+            if max_size >= body_size - 0.3:
+                return f"[H{level}]"
 
     # Appendix letter headings (A ..., B.1 ..., etc.)
-    if _is_appendix_heading_text(t):
-        m2 = re.match(r"^([A-Z])((?:\.\d+)+)?\s+(.+)$", t)
-        if m2 and is_spanning and max_size >= body_size - 0.3 and len(t) <= 160 and not t.endswith("."):
-            title = (m2.group(3) or "").strip()
-            if title and not _looks_like_equation_text(title):
-                suffix = m2.group(2) or ""
-                if suffix:
-                    level = min(3, suffix.count(".") + 1)
-                    return f"[H{level}]"
+    appendix_level = _parse_appendix_heading_level(t)
+    if appendix_level is not None:
+        if t.upper() == "APPENDIX":
+            if is_spanning and max_size >= body_size - 0.3:
                 return "[H1]"
+        elif is_spanning and max_size >= body_size - 0.3 and len(t) <= 160 and not t.endswith("."):
+            level = min(3, int(appendix_level))
+            return f"[H{level}]"
 
     # Keyword headings. Some PDFs do not bold/resize "REFERENCES", so allow it more loosely.
     keywords_strict = {"ABSTRACT", "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS"}
     if (
         t.upper() in keywords_strict
-        and is_spanning
         and is_bold
-        and max_size >= body_size + 0.8
+        and max_size >= body_size + 0.4
+        and (is_spanning or (page_index <= 1 and _bbox_width(bbox) >= page_width * 0.22))
         and len(t) <= 40
     ):
         return "[H1]"
-    if t.upper() == "REFERENCES" and is_spanning and max_size >= body_size - 0.2 and len(t) <= 40:
+    if t.upper() == "REFERENCES" and max_size >= body_size - 0.4 and len(t) <= 40:
         return "[H1]"
 
     return None
@@ -653,6 +709,82 @@ def _pick_column_range(rect: fitz.Rect, page_width: float) -> tuple[float, float
 
 def _overlap_1d(a0: float, a1: float, b0: float, b1: float) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _union_rect(rects: list["fitz.Rect"]) -> Optional["fitz.Rect"]:
+    if not rects:
+        return None
+    x0 = min(float(r.x0) for r in rects)
+    y0 = min(float(r.y0) for r in rects)
+    x1 = max(float(r.x1) for r in rects)
+    y1 = max(float(r.y1) for r in rects)
+    return fitz.Rect(x0, y0, x1, y1)
+
+
+def _collect_visual_rects(page) -> list["fitz.Rect"]:
+    """
+    Collect visual regions that may represent figures/charts:
+    - embedded image bboxes
+    - large vector drawing bboxes (for plots not embedded as images)
+    """
+    if fitz is None:
+        return []
+
+    page_w = float(page.rect.width)
+    page_h = float(page.rect.height)
+    page_area = max(1.0, page_w * page_h)
+    out: list[fitz.Rect] = []
+
+    for info in (page.get_image_info() or []):
+        if "bbox" not in info:
+            continue
+        try:
+            r = fitz.Rect(info["bbox"])
+        except Exception:
+            continue
+        if r.width <= 1.0 or r.height <= 1.0:
+            continue
+        out.append(r)
+
+    # Vector charts/diagrams may not appear in get_image_info().
+    try:
+        for d in (page.get_drawings() or []):
+            r0 = d.get("rect")
+            if not r0:
+                continue
+            try:
+                r = fitz.Rect(r0)
+            except Exception:
+                continue
+            area = max(0.0, float(r.width) * float(r.height))
+            if area < page_area * 0.003:
+                continue
+            if area > page_area * 0.92:
+                continue
+            if float(r.width) < page_w * 0.12 or float(r.height) < page_h * 0.05:
+                continue
+            # Skip decorative rules.
+            if float(r.height) < page_h * 0.02 and float(r.width) > page_w * 0.7:
+                continue
+            out.append(r)
+    except Exception:
+        pass
+
+    # De-duplicate near-identical rectangles.
+    seen: set[tuple[int, int, int, int]] = set()
+    uniq: list[fitz.Rect] = []
+    for r in out:
+        key = (
+            int(round(float(r.x0) * 2)),
+            int(round(float(r.y0) * 2)),
+            int(round(float(r.x1) * 2)),
+            int(round(float(r.y1) * 2)),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+    return uniq
 
 
 def _math_fragment_score(b: "TextBlock", *, body_size: float) -> int:
@@ -1062,8 +1194,9 @@ def extract_figures_by_captions(
     image_alpha: bool = False,
 ) -> tuple[dict[int, str], list["fitz.Rect"]]:
     caption_re = re.compile(r"^\s*(?:Fig\.|FIG\.|Figure|FIGURE)\s*([0-9]+)", re.IGNORECASE)
-    img_infos = page.get_image_info() or []
-    img_rects = [fitz.Rect(i["bbox"]) for i in img_infos if "bbox" in i]
+    visual_rects = _collect_visual_rects(page)
+    page_w = float(page.rect.width)
+    page_h = float(page.rect.height)
 
     out: dict[int, str] = {}
     covered: list[fitz.Rect] = []
@@ -1075,51 +1208,82 @@ def extract_figures_by_captions(
         fig_num = m.group(1)
         caption_rect = fitz.Rect(b.bbox)
         col_x0, col_x1 = _pick_column_range(caption_rect, page.rect.width)
+        col_w = max(1.0, float(col_x1 - col_x0))
 
         candidates: list[tuple[float, fitz.Rect]] = []
-        for r in img_rects:
-            if r.y1 > caption_rect.y0 + 10:
+        for r in visual_rects:
+            if r.y1 > caption_rect.y0 + 12.0:
                 continue
-            overlap = _overlap_1d(r.x0, r.x1, col_x0, col_x1)
-            if overlap < min(r.width, (col_x1 - col_x0)) * 0.2:
+            gap = float(caption_rect.y0) - float(r.y1)
+            if gap < -8.0 or gap > page_h * 0.62:
                 continue
-            gap = caption_rect.y0 - r.y1
+            # Keep visuals that overlap caption column (double-column with single-column figures)
+            # or overlap the caption text range itself.
+            overlap_col = _overlap_1d(float(r.x0), float(r.x1), float(col_x0), float(col_x1))
+            overlap_cap = _overlap_1d(float(r.x0), float(r.x1), float(caption_rect.x0) - 14.0, float(caption_rect.x1) + 14.0)
+            if (overlap_col < max(12.0, min(float(r.width), col_w) * 0.16)) and (
+                overlap_cap < max(8.0, min(float(r.width), max(20.0, float(caption_rect.width))) * 0.14)
+            ):
+                continue
             candidates.append((gap, r))
 
-        # Dynamic crop: capture the full column region immediately above the caption.
-        # Rationale: `get_image_info()` bboxes are frequently too tight (vector overlays, labels),
-        # so we prioritize recall even if we include a bit of extra whitespace.
-        max_up = min(page.rect.height * 0.80, caption_rect.y0)
-        y0 = max(0.0, caption_rect.y0 - max_up)
-        # Find previous text block in same column to cap crop top.
-        prev_y1: Optional[float] = None
-        for pj in range(bi - 1, -1, -1):
-            pr = fitz.Rect(blocks[pj].bbox)
-            # same column overlap
-            overlap = _overlap_1d(pr.x0, pr.x1, col_x0, col_x1)
-            if overlap >= min(pr.width, (col_x1 - col_x0)) * 0.3 and pr.y1 <= caption_rect.y0:
-                # Only cap by real paragraph text; do NOT cap by short labels that are often part of the figure.
+        selected_rects: list[fitz.Rect] = []
+        if candidates:
+            # Keep the nearest visual group to avoid swallowing unrelated visuals higher on page.
+            candidates.sort(key=lambda x: x[0])
+            min_gap = float(candidates[0][0])
+            keep_gap = min(page_h * 0.26, min_gap + 96.0)
+            selected_rects = [r for g, r in candidates if float(g) <= keep_gap]
+
+            # Expand with nearby rects that belong to the same visual region.
+            u0 = _union_rect(selected_rects)
+            if u0 is not None:
+                for g, r in candidates:
+                    if r in selected_rects:
+                        continue
+                    if float(g) > (keep_gap + 80.0):
+                        continue
+                    ov = _overlap_1d(float(r.x0), float(r.x1), float(u0.x0), float(u0.x1))
+                    if ov >= max(10.0, min(float(r.width), float(u0.width)) * 0.25):
+                        selected_rects.append(r)
+
+        if selected_rects:
+            u = _union_rect(selected_rects)
+            assert u is not None
+            pad_x = max(8.0, min(18.0, float(u.width) * 0.04))
+            pad_y = max(8.0, min(20.0, float(u.height) * 0.07))
+            crop = fitz.Rect(
+                max(0.0, float(u.x0) - pad_x),
+                max(0.0, float(u.y0) - pad_y),
+                min(page_w, float(u.x1) + pad_x),
+                min(page_h, float(caption_rect.y1) + 10.0),
+            )
+            covered.extend([fitz.Rect(r) for r in selected_rects])
+        else:
+            # No reliable visual bbox: use conservative column fallback around caption.
+            max_up = min(page_h * 0.56, float(caption_rect.y0))
+            y0 = max(0.0, float(caption_rect.y0) - max_up)
+            prev_y1: Optional[float] = None
+            for pj in range(bi - 1, -1, -1):
+                pr = fitz.Rect(blocks[pj].bbox)
+                overlap = _overlap_1d(float(pr.x0), float(pr.x1), float(col_x0), float(col_x1))
+                if overlap < max(10.0, min(float(pr.width), col_w) * 0.30):
+                    continue
+                if float(pr.y1) > float(caption_rect.y0):
+                    continue
                 txt = _normalize_text(blocks[pj].text)
-                if len(txt) >= 90 and not caption_re.match(txt) and not _looks_like_equation_text(txt):
+                if len(txt) >= 90 and (not caption_re.match(txt)) and (not _looks_like_equation_text(txt)):
                     prev_y1 = float(pr.y1)
                     break
-        if prev_y1 is not None:
-            y0 = max(y0, prev_y1 + 6.0)
-
-        # If we have image rectangles, expand upward to include their full extent (avoid cutting tops).
-        if candidates:
-            img_top = min(r.y0 for _, r in candidates)
-            y0 = min(y0, max(0.0, float(img_top) - 10.0))
-            for _, r in candidates:
-                covered.append(fitz.Rect(r))
-
-        pad = 12.0
-        crop = fitz.Rect(
-            max(0.0, col_x0 - pad),
-            max(0.0, y0 - pad),
-            min(page.rect.width, col_x1 + pad),
-            min(page.rect.height, caption_rect.y1 + pad),
-        )
+            if prev_y1 is not None:
+                y0 = max(y0, prev_y1 + 6.0)
+            pad = 10.0
+            crop = fitz.Rect(
+                max(0.0, float(col_x0) - pad),
+                max(0.0, y0 - pad),
+                min(page_w, float(col_x1) + pad),
+                min(page_h, float(caption_rect.y1) + pad),
+            )
 
         img_name = f"figure_{fig_num}_p{page_index + 1:03d}.png"
         pix = page.get_pixmap(matrix=fitz.Matrix(float(image_scale), float(image_scale)), clip=crop, alpha=bool(image_alpha))
@@ -1143,8 +1307,7 @@ def extract_images_fallback(
     Best-effort capture of images that don't have detectable captions.
     Goal: maximize recall (avoid missing figures), while filtering obvious tiny logos/icons.
     """
-    img_infos = page.get_image_info() or []
-    img_rects = [fitz.Rect(i["bbox"]) for i in img_infos if "bbox" in i]
+    img_rects = _collect_visual_rects(page)
     if not img_rects:
         return {}
 
@@ -1299,9 +1462,6 @@ def extract_text_blocks(
         bbox = tuple(float(x) for x in b.get("bbox", (0, 0, 0, 0)))
         rect = fitz.Rect(bbox)
 
-        if rect.y1 < header_y or rect.y0 > footer_y:
-            continue
-
         raw_lines: list[str] = []
         max_size = 0.0
         bold = False
@@ -1326,6 +1486,16 @@ def extract_text_blocks(
         probe = [_normalize_text(x) for x in raw_lines if _normalize_text(x)]
         if not probe:
             continue
+        joined_probe = _normalize_text(" ".join(probe))
+
+        # Header/footer band filter, but keep real structural content.
+        if rect.y1 < header_y or rect.y0 > footer_y:
+            is_caption0 = bool(re.match(r"^\s*(?:Fig\.|FIG\.|Figure|FIGURE)\s*[0-9]+", joined_probe, re.IGNORECASE))
+            is_eqno0 = bool(re.fullmatch(r"\(\s*\d{1,4}\s*\)", joined_probe))
+            is_struct_heading0 = bool(_is_numbered_heading_text(joined_probe) or _is_appendix_heading_text(joined_probe))
+            if (not is_caption0) and (not is_eqno0) and (not is_struct_heading0):
+                if max_size < body_size + 0.2:
+                    continue
 
         # If a text block is almost fully inside an image rect, it's often garbage (publisher logos),
         # but captions may also intersect (depending on how the PDF encodes bbox). Keep captions and equation numbers.
@@ -1334,7 +1504,6 @@ def extract_text_blocks(
             inter = max((_rect_area(rect.intersect(r)) for r in img_rects), default=0.0)
             inside_ratio = inter / block_area
             if inside_ratio > 0.78:
-                joined_probe = _normalize_text(" ".join(probe))
                 if not re.match(r"^\s*(?:Fig\.|FIG\.|Figure|FIGURE)\s*[0-9]+", joined_probe, re.IGNORECASE) and not re.fullmatch(
                     r"\(\s*\d{1,4}\s*\)", joined_probe
                 ):
@@ -1345,15 +1514,16 @@ def extract_text_blocks(
         # Extra non-body filter: small text near margins/bands (journal footers, figure credits, etc.)
         # Disable/relax this in REFERENCES pages to avoid dropping right-column items and page-continued refs.
         if (not relax_small_text_filter) and max_size < body_size - 0.6:
-            near_top = rect.y1 < 160.0
-            near_bottom = rect.y0 > H - 160.0
-            near_side = rect.x0 < 40.0 or rect.x1 > W - 40.0
+            near_top = rect.y1 < 110.0
+            near_bottom = rect.y0 > H - 110.0
+            near_side = rect.x0 < 28.0 or rect.x1 > W - 28.0
             # Keep equation numbers even if they sit near the right margin.
-            joined_probe = _normalize_text(" ".join(probe))
             # Keep figure captions even when small and close to margins (common in two-column PDFs).
             is_eqno = bool(re.fullmatch(r"\(\s*\d{1,4}\s*\)", joined_probe))
             is_caption = bool(re.match(r"^\s*(?:Fig\.|FIG\.|Figure|FIGURE)\s*[0-9]+", joined_probe, re.IGNORECASE))
-            if (near_top or near_bottom or near_side) and (not is_eqno) and (not is_caption):
+            is_heading = bool(_is_numbered_heading_text(joined_probe) or _is_appendix_heading_text(joined_probe))
+            short_margin_noise = len(joined_probe) <= 90
+            if (near_top or near_bottom or near_side) and short_margin_noise and (not is_eqno) and (not is_caption) and (not is_heading):
                 continue
 
         is_table = _looks_like_table_block(probe)
@@ -1443,9 +1613,19 @@ def _tagged_page_text(
             out.append("")
 
         if b.heading_level:
+            title = _normalize_text(b.text).strip()
             lvl = int(b.heading_level)
-            if 1 <= lvl <= 3 and (_is_numbered_heading_text(b.text.strip()) or _is_appendix_heading_text(b.text.strip())):
-                out.append(f"[H{lvl}] {b.text.strip()}")
+            numbered_level = _parse_numbered_heading_level(title)
+            appendix_level = _parse_appendix_heading_level(title)
+            if numbered_level is not None:
+                lvl = int(numbered_level)
+            elif appendix_level is not None:
+                lvl = int(appendix_level)
+            if 1 <= lvl <= 3 and _is_strict_heading_text(title):
+                if title.upper() in _ALLOWED_UNNUMBERED_HEADINGS:
+                    lvl = 1
+                    title = title.upper()
+                out.append(f"[H{lvl}] {title}")
                 out.append("")
                 continue
 
@@ -2448,34 +2628,20 @@ _ALLOWED_UNNUMBERED_HEADINGS = {
 
 
 def _is_numbered_heading_text(title: str) -> bool:
-    t = _normalize_text(title)
-    m = re.match(r"^(\d+(?:\.\d+)*)\s+(.+)$", t)
-    if not m:
-        return False
-    rest = (m.group(2) or "").strip()
-    if not rest:
-        return False
-    # Avoid equations like "2(x)^T ..." and other math lines.
-    if not _is_letter(rest[0]):
-        return False
-    if _looks_like_equation_text(rest):
-        return False
-    return True
+    return _parse_numbered_heading_level(title) is not None
 
 
 def _is_appendix_heading_text(title: str) -> bool:
-    # Common appendix heading styles:
-    # - "APPENDIX"
-    # - "A DETAILS OF ..."
-    # - "B.1 Something" / "C.2.1 Something"
-    t = title.strip()
-    if t.upper() == "APPENDIX":
+    return _parse_appendix_heading_level(title) is not None
+
+
+def _is_strict_heading_text(title: str) -> bool:
+    t = _normalize_text(title or "").strip()
+    if not t:
+        return False
+    if _is_numbered_heading_text(t) or _is_appendix_heading_text(t):
         return True
-    if re.match(r"^[A-Z]\s+\S", t):
-        return True
-    if re.match(r"^[A-Z](?:\.\d+)+\s+\S", t):
-        return True
-    return False
+    return t.upper() in _ALLOWED_UNNUMBERED_HEADINGS
 
 
 def _fix_split_numbered_headings(md: str) -> str:
@@ -2505,8 +2671,8 @@ def _fix_split_numbered_headings(md: str) -> str:
             i += 1
             continue
 
-        # "# 8" + next line => "# 8 TITLE"
-        m = re.fullmatch(r"#\s*(\d+(?:\.\d+)*)\s*$", st)
+        # "# 8" / "# 2.1." + next line => heading line with proper level.
+        m = re.fullmatch(r"#\s*(\d+(?:\.\d+)*)(?:[.)]|）)?\s*$", st)
         if m and i + 1 < len(lines):
             nxt = lines[i + 1].strip()
             if nxt and nxt.upper() == nxt and len(nxt) >= 4:
@@ -2515,8 +2681,8 @@ def _fix_split_numbered_headings(md: str) -> str:
                 i += 2
                 continue
 
-        # "2.3" + next line => "## 2.3 Title"
-        m = re.fullmatch(r"(\d+(?:\.\d+)*)\s*$", st)
+        # "2.3" / "2.3." + next line => heading line with proper level.
+        m = re.fullmatch(r"(\d+(?:\.\d+)*)(?:[.)]|）)?\s*$", st)
         if m and i + 1 < len(lines):
             # Guard against DOI fragments like "3530127" or "344779.344936" being mis-promoted to headings.
             tok = m.group(1)
@@ -2582,8 +2748,19 @@ def _enforce_heading_policy(md: str) -> str:
         if not title:
             continue
 
-        if _is_numbered_heading_text(title) or _is_appendix_heading_text(title):
-            out.append(line)
+        numbered_level = _parse_numbered_heading_level(title)
+        if numbered_level is not None:
+            lvl = max(1, min(3, int(numbered_level)))
+            out.append("#" * lvl + " " + title)
+            continue
+
+        appendix_level = _parse_appendix_heading_level(title)
+        if appendix_level is not None:
+            lvl = max(1, min(3, int(appendix_level)))
+            if title.upper() in _ALLOWED_UNNUMBERED_HEADINGS:
+                out.append("# " + title.upper())
+            else:
+                out.append("#" * lvl + " " + title)
             continue
 
         if title.upper() in _ALLOWED_UNNUMBERED_HEADINGS:
@@ -2748,6 +2925,22 @@ def _normalize_display_latex(latex: str, *, eq_number: Optional[str] = None) -> 
 
     # Never keep model-produced tags; we attach numbering ourselves.
     s = re.sub(r"\\tag\{[^}]+\}", "", s).strip()
+    # Some extractions lose one side of \left...\right. Strip extras to avoid renderer errors.
+    lft = len(re.findall(r"\\left\b", s))
+    rgt = len(re.findall(r"\\right\b", s))
+    if lft != rgt:
+        if lft > rgt:
+            for _ in range(lft - rgt):
+                s2 = re.sub(r"\\left\b\s*", "", s, count=1)
+                if s2 == s:
+                    break
+                s = s2
+        else:
+            for _ in range(rgt - lft):
+                s2 = re.sub(r"\\right\b\s*", "", s, count=1)
+                if s2 == s:
+                    break
+                s = s2
 
     if eq_number:
         n = str(eq_number).strip()
@@ -2760,6 +2953,10 @@ def _normalize_display_latex(latex: str, *, eq_number: Optional[str] = None) -> 
             else:
                 # KaTeX supports top-level \\tag inside $$...$$; avoid placing \\tag inside `aligned`.
                 s = s.rstrip() + f"\n\\tag{{{n}}}"
+
+    # Last gate before writing into $$...$$: reject obviously unbalanced LaTeX.
+    if not _is_balanced_latex(s):
+        return None
 
     # Conservative fragment guard: drop bare operators without any real body.
     if len(s) <= 28 and re.search(r"\\(?:sum|prod|int)\b", s) and not re.search(r"[=A-Za-z0-9\\\\]", s.replace("\\sum", "").replace("\\prod", "").replace("\\int", "")):
@@ -2787,6 +2984,14 @@ def _math_text_looks_garbled(s: str) -> bool:
     alnum = sum(1 for ch in t if ch.isalnum())
     if len(t) > 120 and alnum / max(1, len(t)) < 0.18:
         return True
+    # Broken LaTeX structure almost always fails Markdown math renderers.
+    if "\\" in t:
+        if not _is_balanced_latex(t):
+            return True
+        lft = len(re.findall(r"\\left\b", t))
+        rgt = len(re.findall(r"\\right\b", t))
+        if lft != rgt:
+            return True
     return False
 
 
@@ -2800,6 +3005,38 @@ class PdfToMarkdown:
             if OpenAI is None:
                 raise RuntimeError("`openai` package is not available, but LLM is configured.")
             self._client = OpenAI(api_key=cfg.llm.api_key, base_url=cfg.llm.base_url)
+
+    def _llm_create(
+        self,
+        *,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: Optional[int] = None,
+    ):
+        if not self.cfg.llm or not self._client:
+            raise RuntimeError("LLM is not configured")
+        llm = self.cfg.llm
+        timeout_s = max(8.0, float(getattr(llm, "timeout_s", 60.0) or 60.0))
+        retries = max(0, int(getattr(llm, "max_retries", 1) or 0))
+        mt = int(max_tokens if max_tokens is not None else llm.max_tokens)
+        last_err: Optional[Exception] = None
+        for attempt in range(retries + 1):
+            try:
+                kwargs = {
+                    "model": llm.model,
+                    "messages": messages,
+                    "temperature": float(temperature),
+                    "timeout": timeout_s,
+                }
+                if mt > 0:
+                    kwargs["max_tokens"] = mt
+                return self._client.chat.completions.create(**kwargs)
+            except Exception as e:
+                last_err = e
+                if attempt >= retries:
+                    break
+                time.sleep(min(2.5, 0.5 * (attempt + 1)))
+        raise last_err if last_err is not None else RuntimeError("LLM request failed")
 
     def _call_llm_convert(self, tagged_text: str, page_number: int) -> str:
         if not self.cfg.llm or not self._client:
@@ -2836,7 +3073,8 @@ MANDATORY RULES:
     - Keep figure captions (lines starting with `Fig.` / `Figure`) directly under the image. Bold the `Fig. X.` prefix.
 7) REFERENCES: Under `# REFERENCES`, format references as a numbered list (one entry per item). Preserve content; only add line breaks/list markers.
 8) BULLETS: Replace `•` bullets with Markdown list items (`- `).
-9) OUTPUT: Markdown only. No commentary.
+9) FIDELITY: Keep all non-tag text exactly once (no omissions, no paraphrase, no added facts).
+10) OUTPUT: Markdown only. No commentary.
 
 PAGE: {page_number}
 """.strip()
@@ -2854,16 +3092,19 @@ TEXT:
 {chunk}
 ---
 """.strip()
-            resp = self._client.chat.completions.create(
-                model=llm.model,
-                messages=[
-                    {"role": "system", "content": "You are a strict robotic text-to-markdown converter. Follow tags verbatim."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=llm.temperature,
-                max_tokens=llm.max_tokens,
-            )
-            out_parts.append(resp.choices[0].message.content or "")
+            try:
+                resp = self._llm_create(
+                    messages=[
+                        {"role": "system", "content": "You are a strict robotic text-to-markdown converter. Follow tags verbatim."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=llm.temperature,
+                    max_tokens=llm.max_tokens,
+                )
+                out_parts.append(resp.choices[0].message.content or "")
+            except Exception as e:
+                print(f"WARNING: LLM render fallback on page {page_number} chunk {chunk_i}: {e}")
+                out_parts.append(self._fallback_convert_tags(chunk))
         return "\n\n".join(p.strip() for p in out_parts if p.strip()).strip()
 
     def _repair_cache_path(self, *, kind: str, page_number: int, block_index: int, raw: str) -> Optional[Path]:
@@ -2918,15 +3159,17 @@ TEXT:
         llm = self.cfg.llm
         if llm.request_sleep_s > 0:
             time.sleep(llm.request_sleep_s)
-        resp = self._client.chat.completions.create(
-            model=llm.model,
-            messages=[
-                {"role": "system", "content": "You convert tables to Markdown. Output only the table."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=min(llm.max_tokens, 4096),
-        )
+        try:
+            resp = self._llm_create(
+                messages=[
+                    {"role": "system", "content": "You convert tables to Markdown. Output only the table."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=min(llm.max_tokens, 4096),
+            )
+        except Exception:
+            return None
         out = (resp.choices[0].message.content or "").strip()
         # Minimal validation: must have pipes and a separator row.
         if "|" not in out or not re.search(r"(?m)^\|\s*---", out):
@@ -2978,15 +3221,17 @@ TEXT:
         llm = self.cfg.llm
         if llm.request_sleep_s > 0:
             time.sleep(llm.request_sleep_s)
-        resp = self._client.chat.completions.create(
-            model=llm.model,
-            messages=[
-                {"role": "system", "content": "You convert extracted math into valid LaTeX. Output LaTeX only."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=min(llm.max_tokens, 2048),
-        )
+        try:
+            resp = self._llm_create(
+                messages=[
+                    {"role": "system", "content": "You convert extracted math into valid LaTeX. Output LaTeX only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=min(llm.max_tokens, 2048),
+            )
+        except Exception:
+            return None
         out = (resp.choices[0].message.content or "").strip()
         if not out:
             return None
@@ -3015,15 +3260,17 @@ TEXT:
         llm = self.cfg.llm
         if llm.request_sleep_s > 0:
             time.sleep(llm.request_sleep_s)
-        resp = self._client.chat.completions.create(
-            model=llm.model,
-            messages=[
-                {"role": "system", "content": "You clean up pseudocode. Output code only."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=min(llm.max_tokens, 2048),
-        )
+        try:
+            resp = self._llm_create(
+                messages=[
+                    {"role": "system", "content": "You clean up pseudocode. Output code only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=min(llm.max_tokens, 2048),
+            )
+        except Exception:
+            return None
         out = (resp.choices[0].message.content or "").strip("\n")
         if not out.strip():
             return None
@@ -3057,15 +3304,17 @@ TEXT:
         llm = self.cfg.llm
         if llm.request_sleep_s > 0:
             time.sleep(llm.request_sleep_s)
-        resp = self._client.chat.completions.create(
-            model=llm.model,
-            messages=[
-                {"role": "system", "content": "You fix inline math. Output one Markdown paragraph only."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=min(llm.max_tokens, 2048),
-        )
+        try:
+            resp = self._llm_create(
+                messages=[
+                    {"role": "system", "content": "You fix inline math. Output one Markdown paragraph only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=min(llm.max_tokens, 2048),
+            )
+        except Exception:
+            return None
         out = (resp.choices[0].message.content or "").strip()
         # safety: no headings/bullets/fences
         if re.search(r"(?m)^\s*(#|```|\- |\* )", out):
@@ -3098,15 +3347,17 @@ TEXT:
         llm = self.cfg.llm
         if llm.request_sleep_s > 0:
             time.sleep(llm.request_sleep_s)
-        resp = self._client.chat.completions.create(
-            model=llm.model,
-            messages=[
-                {"role": "system", "content": "You split references into a numbered Markdown list."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=min(llm.max_tokens, 4096),
-        )
+        try:
+            resp = self._llm_create(
+                messages=[
+                    {"role": "system", "content": "You split references into a numbered Markdown list."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=min(llm.max_tokens, 4096),
+            )
+        except Exception:
+            return None
         out = (resp.choices[0].message.content or "").strip()
         if not out:
             return None
@@ -3181,11 +3432,20 @@ TEXT:
                     continue
                 out.append("")
 
-            if b.heading_level and 1 <= int(b.heading_level) <= 3 and (
-                _is_numbered_heading_text(b.text) or _is_appendix_heading_text(b.text)
-            ):
+            if b.heading_level and 1 <= int(b.heading_level) <= 3 and _is_strict_heading_text(b.text):
+                title = _normalize_text(b.text).strip()
                 lvl = int(b.heading_level)
-                out.append("#" * lvl + " " + b.text.strip())
+                numbered_level = _parse_numbered_heading_level(title)
+                appendix_level = _parse_appendix_heading_level(title)
+                if numbered_level is not None:
+                    lvl = int(numbered_level)
+                elif appendix_level is not None:
+                    lvl = int(appendix_level)
+                lvl = max(1, min(3, lvl))
+                if title.upper() in _ALLOWED_UNNUMBERED_HEADINGS:
+                    lvl = 1
+                    title = title.upper()
+                out.append("#" * lvl + " " + title)
                 out.append("")
                 continue
 
@@ -3203,13 +3463,8 @@ TEXT:
                 continue
 
             if b.is_math:
-                # If extracted math is clearly garbled (common in --no-llm mode), render it as an image instead of
-                # emitting broken LaTeX/Unicode fragments.
+                # Keep equation image as a late fallback (after LaTeX repair/normalization attempt).
                 eq_img = eqimg_by_block.get(bi)
-                if eq_img:
-                    out.append(f"![Equation](./assets/{eq_img})")
-                    out.append("")
-                    continue
                 # Some PDFs encode tables as LaTeX arrays inside math blocks.
                 if re.search(r"\\begin\{(?:array|tabular)\}", b.text):
                     table_md = _latex_array_to_markdown_table(b.text)
@@ -3259,8 +3514,11 @@ TEXT:
                     out.append(latex_norm)
                     out.append("$$")
                 else:
-                    # Avoid emitting broken LaTeX that crashes renderers.
-                    out.extend([ln.rstrip() for ln in b.text.splitlines() if ln.strip()])
+                    if eq_img:
+                        out.append(f"![Equation](./assets/{eq_img})")
+                    else:
+                        # Avoid emitting broken LaTeX that crashes renderers.
+                        out.extend([ln.rstrip() for ln in b.text.splitlines() if ln.strip()])
                 out.append("")
                 continue
 
@@ -3364,15 +3622,17 @@ INPUT JSON:
             items = pack(sub, offset=start)
             if llm.request_sleep_s > 0:
                 time.sleep(llm.request_sleep_s)
-            resp = self._client.chat.completions.create(
-                model=llm.model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": make_prompt(items)},
-                ],
-                temperature=0.0,
-                max_tokens=llm.max_tokens,
-            )
+            try:
+                resp = self._llm_create(
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": make_prompt(items)},
+                    ],
+                    temperature=0.0,
+                    max_tokens=llm.max_tokens,
+                )
+            except Exception:
+                return None
             content = resp.choices[0].message.content or ""
             arr = self._extract_json_array(content)
             if not isinstance(arr, list) or len(arr) != len(items):
@@ -3391,11 +3651,14 @@ INPUT JSON:
         )
         if llm.request_sleep_s > 0:
             time.sleep(llm.request_sleep_s)
-        resp = self._client.chat.completions.create(
-            model=llm.model,
-            messages=[{"role": "system", "content": "Translator mode."}, {"role": "user", "content": prompt}],
-            temperature=0.0,
-        )
+        try:
+            resp = self._llm_create(
+                messages=[{"role": "system", "content": "Translator mode."}, {"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=llm.max_tokens,
+            )
+        except Exception:
+            return md
         return (resp.choices[0].message.content or md).strip()
 
     def _fallback_convert_tags(self, tagged_text: str) -> str:
@@ -3632,12 +3895,23 @@ INPUT JSON:
                         is_code = kind == "code"
                         hl: Optional[int] = None
                         if kind == "heading":
-                            try:
-                                hl = int(heading_level) if heading_level is not None else None
-                            except Exception:
-                                hl = None
-                            if not (_is_numbered_heading_text(text) or _is_appendix_heading_text(text)):
-                                hl = None
+                            numbered_level = _parse_numbered_heading_level(text)
+                            appendix_level = _parse_appendix_heading_level(text)
+                            if numbered_level is not None:
+                                hl = max(1, min(3, int(numbered_level)))
+                            elif appendix_level is not None:
+                                hl = max(1, min(3, int(appendix_level)))
+                            else:
+                                t_upper = _normalize_text(text).strip().upper()
+                                if t_upper in _ALLOWED_UNNUMBERED_HEADINGS:
+                                    hl = 1
+                                else:
+                                    try:
+                                        hl = int(heading_level) if heading_level is not None else None
+                                    except Exception:
+                                        hl = None
+                                    if hl is not None:
+                                        hl = max(1, min(3, int(hl)))
                         updated.append(
                             TextBlock(
                                 bbox=b.bbox,
@@ -3742,9 +4016,13 @@ INPUT JSON:
 
                 # Optional fallback: render obviously-garbled display math as equation images.
                 eq_imgs: dict[int, str] = {}
-                if self.cfg.eq_image_fallback and not (
-                    self.cfg.llm and (self.cfg.llm_repair or self.cfg.llm_render_page)
-                ):
+                need_eq_image_fallback = bool(self.cfg.eq_image_fallback)
+                if not need_eq_image_fallback:
+                    try:
+                        need_eq_image_fallback = any(b.is_math and _math_text_looks_garbled(b.text) for b in blocks)
+                    except Exception:
+                        need_eq_image_fallback = False
+                if need_eq_image_fallback:
                     eq_imgs = extract_equation_images_for_garbled_math(
                         page,
                         blocks,
@@ -3867,10 +4145,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> ConvertConfig:
     ap.add_argument(
         "--eq-image-fallback",
         action="store_true",
-        help="Fallback: render garbled display-math as equation images (only affects --no-llm style runs)",
+        help="Fallback: render garbled display-math as equation images when LaTeX is unreliable",
     )
     ap.add_argument("--no-global-noise-scan", action="store_true", help="Skip global header/footer scan (faster, less clean)")
     ap.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between LLM requests")
+    ap.add_argument("--llm-timeout", type=float, default=float(os.environ.get("DEEPSEEK_TIMEOUT_S", "45")), help="Per-request LLM timeout seconds")
+    ap.add_argument("--llm-retries", type=int, default=int(os.environ.get("DEEPSEEK_RETRIES", "0")), help="Retries for each LLM request")
     args = ap.parse_args(argv)
 
     pdf_path = Path(args.pdf).expanduser().resolve()
@@ -3898,6 +4178,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> ConvertConfig:
             base_url=base_url,
             model=str(args.model),
             request_sleep_s=float(args.sleep),
+            timeout_s=float(args.llm_timeout),
+            max_retries=max(0, int(args.llm_retries)),
         )
 
     return ConvertConfig(
@@ -3919,8 +4201,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> ConvertConfig:
         eq_image_fallback=bool(args.eq_image_fallback),
         global_noise_scan=(not bool(args.no_global_noise_scan)),
         llm_repair=(not bool(args.no_llm_repair)),
-        # Prefer higher fidelity by default when LLM is enabled; can be turned off via --no-llm-repair-body-math.
-        llm_repair_body_math=bool(args.llm_repair_body_math) or (llm is not None and not bool(args.no_llm_repair_body_math)),
+        # Keep off by default to avoid long stalls; users can opt-in via --llm-repair-body-math.
+        llm_repair_body_math=bool(args.llm_repair_body_math) and (not bool(args.no_llm_repair_body_math)),
     )
 
 

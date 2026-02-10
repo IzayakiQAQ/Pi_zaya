@@ -540,9 +540,7 @@ def _bg_remove_queued_tasks_for_pdf(pdf_path: Path) -> int:
 def _bg_cancel_all() -> None:
     with _BG_LOCK:
         _BG_STATE["cancel"] = True
-        _BG_STATE["cur_page_done"] = 0
-        _BG_STATE["cur_page_total"] = 0
-        _BG_STATE["cur_page_msg"] = ""
+        _BG_STATE["cur_page_msg"] = "正在停止当前转换…"
 
 
 def _bg_snapshot() -> dict:
@@ -587,7 +585,8 @@ def _bg_worker_loop() -> None:
         pdf = Path(task["pdf"])
         out_root = Path(task["out_root"])
         db_dir = Path(task.get("db_dir") or "").expanduser() if task.get("db_dir") else None
-        no_llm = bool(task.get("no_llm", True))
+        no_llm = bool(task.get("no_llm", False))
+        eq_image_fallback = bool(task.get("eq_image_fallback", True))
         replace = bool(task.get("replace", False))
 
         try:
@@ -613,15 +612,24 @@ def _bg_worker_loop() -> None:
                     except Exception:
                         pass
 
+            def _should_cancel() -> bool:
+                with _BG_LOCK:
+                    return bool(_BG_STATE.get("cancel"))
+
             ok, out_folder = run_pdf_to_md(
                 pdf_path=pdf,
                 out_root=out_root,
                 no_llm=no_llm,
                 keep_debug=False,
-                eq_image_fallback=False,
+                eq_image_fallback=eq_image_fallback,
                 progress_cb=_on_progress,
+                cancel_cb=_should_cancel,
             )
-            msg = f"OK: {out_folder}" if ok else f"FAIL: {out_folder}"
+            if ok:
+                msg = f"OK: {out_folder}"
+            else:
+                txt = str(out_folder or "").strip().lower()
+                msg = "CANCELLED" if txt == "cancelled" else f"FAIL: {out_folder}"
 
             # Auto-ingest the generated markdown so chat can retrieve it after DB reload.
             if ok and db_dir:
@@ -4255,6 +4263,7 @@ def _page_chat(
 
 def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: Path, prefs: dict, retriever_reload_flag: dict) -> None:
     _bg_ensure_started()
+    bg_auto_rerun_issued = False
 
     retriever_err = str(st.session_state.get("retriever_load_error") or "").strip()
     if retriever_err:
@@ -4720,7 +4729,7 @@ def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: P
 
     st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
     st.subheader(S["convert_opts"])
-    no_llm = st.checkbox(S["no_llm"], value=True, key="lib_no_llm")
+    no_llm = st.checkbox(S["no_llm"], value=False, key="lib_no_llm")
 
     st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
     st.subheader("\u5df2\u6709\u6587\u732e")
@@ -4772,6 +4781,7 @@ def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: P
             """
             Render background conversion progress where users are looking: under conversion tasks.
             """
+            nonlocal bg_auto_rerun_issued
             bg2 = _bg_snapshot()
             running = bool(bg2.get("running")) or (bg2.get("total", 0) and bg2.get("done", 0) < bg2.get("total", 0))
             if not running:
@@ -4808,7 +4818,7 @@ def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: P
                     st.caption(f"\u6700\u8fd1\u4e00\u6761\uff1a{last}")
 
             # Auto refresh while running so the progress bar updates without manual clicks.
-            auto_key = "bg_auto_refresh"
+            auto_key = f"bg_auto_refresh_{key_ns}"
             if auto_key not in st.session_state:
                 st.session_state[auto_key] = True
             auto = st.checkbox("\u81ea\u52a8\u5237\u65b0\u8fdb\u5ea6", value=bool(st.session_state.get(auto_key)), key=auto_key)
@@ -4833,6 +4843,12 @@ def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: P
                     """,
                     height=0,
                 )
+                # Reliable fallback: some Streamlit versions ignore JS postMessage reruns.
+                # Keep progress moving with a lightweight server-side polling rerun.
+                if not bg_auto_rerun_issued:
+                    bg_auto_rerun_issued = True
+                    time.sleep(0.9)
+                    st.experimental_rerun()
 
         def render_items(items: list[dict], *, show_missing_badge: bool, key_ns: str) -> None:
             from typing import Optional
@@ -4929,6 +4945,7 @@ def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: P
                                         "out_root": str(md_out_root),
                                         "db_dir": str(db_dir),
                                         "no_llm": bool(no_llm),
+                                        "eq_image_fallback": True,
                                         "replace": bool(replace),
                                         "name": pdf.name,
                                     }
@@ -5029,6 +5046,7 @@ def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: P
                                 "out_root": str(md_out_root),
                                 "db_dir": str(db_dir),
                                 "no_llm": bool(no_llm),
+                                "eq_image_fallback": True,
                                 "replace": False,
                                 "name": pdf.name,
                             })
@@ -5129,6 +5147,7 @@ def _page_library(settings, lib_store: LibraryStore, db_dir: Path, prefs_path: P
                             "out_root": str(md_out_root),
                             "db_dir": str(db_dir),
                             "no_llm": bool(no_llm),
+                            "eq_image_fallback": True,
                             "replace": False,
                             "name": dest_pdf.name,
                         })
