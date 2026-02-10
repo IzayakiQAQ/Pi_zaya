@@ -56,7 +56,7 @@ S = {
     "thinking": "\u601d\u8003\u4e2d...",
     "refs": "\u53c2\u8003\u5b9a\u4f4d",
     "no_msgs": "\u8fd8\u6ca1\u6709\u6d88\u606f\uff0c\u4e0b\u9762\u8f93\u5165\u95ee\u9898\u5f00\u59cb\u5427\u3002",
-    "kb_empty": "DB \u91cc\u8fd8\u6ca1\u6709 chunks\uff1a{db}\u3002\u8bf7\u5148\u8fd0\u884c ingest.py \u5efa\u5e93\u3002",
+    "kb_empty": "DB \u91cc\u8fd8\u6ca1\u6709 chunks\uff1a{db}\u3002\u8bf7\u5230\u300c\u6587\u732e\u7ba1\u7406\u300d\u9875\uff1a\u8bbe\u7f6e PDF \u76ee\u5f55 \u2192 \u8f6c\u6362\u6210 MD \u2192 \u70b9\u51fb\u300c\u66f4\u65b0\u77e5\u8bc6\u5e93\u300d\uff08\u6216\u8fd0\u884c ingest.py\uff09\u3002",
     "llm_fail": "\uff08\u8c03\u7528\u6a21\u578b\u5931\u8d25\uff1a{err}\uff09\n\n\u8bf7\u68c0\u67e5 DEEPSEEK_API_KEY / BASE_URL / MODEL \u662f\u5426\u6b63\u786e\u3002",
     "page": "\u9875\u9762",
     "page_chat": "\u5bf9\u8bdd",
@@ -3279,6 +3279,10 @@ def _page_chat(
     st.subheader(S["chat"])
     _inject_copy_js()
     _qa_ensure_started()
+
+    retriever_err = str(st.session_state.get("retriever_load_error") or "").strip()
+    if retriever_err:
+        st.error(f"\u77e5\u8bc6\u5e93\u52a0\u8f7d\u5931\u8d25\uff1a{retriever_err}")
     if "session_id" not in st.session_state:
         st.session_state["session_id"] = uuid.uuid4().hex[:10]
     session_id = str(st.session_state.get("session_id") or "").strip()
@@ -3409,10 +3413,14 @@ def _page_chat(
     awaiting = bool(last_role == "user" and last_user_sig and (has_any_for_conv or awaiting_recent))
 
     with gen_details_panel.container():
-        with st.expander("回答队列（可展开）", expanded=running_this or bool(q_items) or awaiting):
+        with st.expander("回答队列（可展开）", expanded=running_session or running_this or bool(q_items) or awaiting):
             if running_session and isinstance(cur, dict):
                 stage = str(cur.get("stage") or "").strip()
                 char_count = int(cur.get("char_count") or 0)
+                try:
+                    elapsed = max(0.0, time.time() - float(cur.get("started_at") or time.time()))
+                except Exception:
+                    elapsed = 0.0
                 c0 = st.columns([1.2, 1.6, 9.2])
                 with c0[0]:
                     if st.button("停止", key="qa_stop_btn", help="停止当前回答生成"):
@@ -3430,7 +3438,7 @@ def _page_chat(
                         other = "（其他对话）" if str(cur.get("conv_id") or "") != conv_id else ""
                     except Exception:
                         other = ""
-                    st.caption(f"当前{other}：{ptxt_s} | 阶段：{stage or '-'} | 已生成：{char_count}")
+                    st.caption(f"当前{other}：{ptxt_s} | 阶段：{stage or '-'} | 已等待：{elapsed:.0f}s | 已生成：{char_count}")
             elif q_items:
                 c1 = st.columns([1.6, 10.4])
                 with c1[0]:
@@ -3443,6 +3451,13 @@ def _page_chat(
                 if awaiting and last_user:
                     st.caption("已提交问题，后台处理中…")
                     last_note = str(qa.get("last") or "").strip()
+                    if isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id:
+                        st.caption(f"阶段：{str(cur.get('stage') or '-')}")
+                        try:
+                            elapsed2 = max(0.0, time.time() - float(cur.get('started_at') or time.time()))
+                            st.caption(f"已等待：{elapsed2:.0f}s")
+                        except Exception:
+                            pass
                     if last_note:
                         st.caption(f"状态：{last_note}")
                 else:
@@ -3491,7 +3506,12 @@ def _page_chat(
         # Keep a short-lived auto refresh so the UI updates.
         with gen_panel.container():
             st.markdown("<div class='msg-meta'>AI（处理中）</div>", unsafe_allow_html=True)
-            st.caption("正在检索/阅读知识库…")
+            stage_txt = ""
+            if isinstance(cur, dict) and str(cur.get("conv_id") or "") == conv_id:
+                stage_txt = str(cur.get("stage") or "").strip()
+                if str(cur.get("status") or "").strip():
+                    stage_txt = (stage_txt + f" / {str(cur.get('status') or '').strip()}").strip(" /")
+            st.caption(f"正在检索/阅读知识库…{('（阶段：' + stage_txt + '）') if stage_txt else ''}")
 
     # Auto refresh while running/queued/awaiting so the UI doesn't look "stuck" without manual clicks.
     if bool(running_session) or bool(q_items) or bool(awaiting):
@@ -4835,6 +4855,27 @@ def main() -> None:
         if prefs_knobs != prefs:
             save_prefs(prefs_path, prefs_knobs)
             prefs.update(prefs_knobs)
+
+        st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+        st.subheader("模型/Key")
+        try:
+            st.caption(f"Base URL: {getattr(settings, 'base_url', '')}")
+            st.caption(f"Model: {getattr(settings, 'model', '')}")
+            st.caption(f"Timeout: {float(getattr(settings, 'timeout_s', 0) or 0):.0f}s | Retries: {int(getattr(settings, 'max_retries', 0) or 0)}")
+        except Exception:
+            pass
+        if getattr(settings, "api_key", None):
+            st.caption("API Key：已设置")
+        else:
+            st.warning("API Key：未设置（需要 DEEPSEEK_API_KEY 或 OPENAI_API_KEY）。设置后需重启 Streamlit。")
+        if st.button("测试模型连接", key="test_llm_btn"):
+            try:
+                with st.spinner("测试中…"):
+                    ds = DeepSeekChat(settings)
+                    out = ds.chat(messages=[{"role": "user", "content": "ping"}], temperature=0.0, max_tokens=8)
+                st.success(f"OK：{out or '(空)'}")
+            except Exception as e:
+                st.error(f"测试失败：{e}")
 
         col_a, col_b = st.columns(2)
         with col_a:
