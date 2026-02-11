@@ -700,9 +700,9 @@ def _init_theme_css(theme_mode: str = "dark") -> None:
   --btn-shadow: 0 1px 0 rgba(0, 0, 0, 0.32), 0 12px 30px rgba(0, 0, 0, 0.42);
   --input-bg: #1f2632;
   --input-border: #505a6d;
-  --msg-user-bg: rgba(77, 170, 252, 0.22);
-  --msg-user-border: rgba(127, 196, 255, 0.45);
-  --msg-user-text: #eef6ff;
+  --msg-user-bg: rgba(77, 170, 252, 0.14);
+  --msg-user-border: rgba(126, 179, 228, 0.40);
+  --msg-user-text: #eaf3ff;
   --msg-ai-bg: #222934;
   --msg-ai-border: #3f4b5f;
   --snip-bg: rgba(148, 163, 184, 0.14);
@@ -732,6 +732,14 @@ def _init_theme_css(theme_mode: str = "dark") -> None:
   --code-border: #3d4658;
   --code-text: #e6edf3;
   --code-inline-bg: rgba(77, 170, 252, 0.14);
+  --code-syn-keyword: #c678dd;
+  --code-syn-string: #98c379;
+  --code-syn-comment: #7f848e;
+  --code-syn-number: #d19a66;
+  --code-syn-func: #61afef;
+  --code-syn-type: #e5c07b;
+  --code-syn-literal: #56b6c2;
+  --code-syn-operator: #abb2bf;
 """
     else:
         tokens = """
@@ -758,8 +766,8 @@ def _init_theme_css(theme_mode: str = "dark") -> None:
   --btn-shadow: 0 1px 0 rgba(16, 24, 40, 0.04), 0 10px 24px rgba(16, 24, 40, 0.06);
   --input-bg: #ffffff;
   --input-border: rgba(31, 35, 41, 0.18);
-  --msg-user-bg: #eaf2ff;
-  --msg-user-border: rgba(15, 108, 189, 0.24);
+  --msg-user-bg: #eef3f9;
+  --msg-user-border: rgba(108, 134, 170, 0.34);
   --msg-user-text: #1f2a37;
   --msg-ai-bg: #ffffff;
   --msg-ai-border: rgba(49, 51, 63, 0.12);
@@ -790,6 +798,14 @@ def _init_theme_css(theme_mode: str = "dark") -> None:
   --code-border: rgba(31, 35, 41, 0.16);
   --code-text: #1f2329;
   --code-inline-bg: rgba(15, 108, 189, 0.10);
+  --code-syn-keyword: #a626a4;
+  --code-syn-string: #50a14f;
+  --code-syn-comment: #a0a1a7;
+  --code-syn-number: #986801;
+  --code-syn-func: #4078f2;
+  --code-syn-type: #c18401;
+  --code-syn-literal: #0184bc;
+  --code-syn-operator: #383a42;
 """
 
     css = """
@@ -1234,6 +1250,63 @@ pre, pre *{
   box-shadow: none !important;
   background-image: none !important;
 }
+.kb-plain-code code,
+.kb-plain-code code.hljs{
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro", "Consolas", "SFMono-Regular", monospace !important;
+  font-size: 0.93rem !important;
+  line-height: 1.62 !important;
+  letter-spacing: 0.002em;
+  color: var(--code-text) !important;
+  background: transparent !important;
+}
+.kb-plain-code .hljs-comment,
+.kb-plain-code .hljs-quote{
+  color: var(--code-syn-comment) !important;
+  font-style: italic;
+}
+.kb-plain-code .hljs-keyword,
+.kb-plain-code .hljs-selector-tag,
+.kb-plain-code .hljs-doctag{
+  color: var(--code-syn-keyword) !important;
+}
+.kb-plain-code .hljs-string,
+.kb-plain-code .hljs-regexp,
+.kb-plain-code .hljs-attr,
+.kb-plain-code .hljs-template-tag{
+  color: var(--code-syn-string) !important;
+}
+.kb-plain-code .hljs-number,
+.kb-plain-code .hljs-literal{
+  color: var(--code-syn-number) !important;
+}
+.kb-plain-code .hljs-title,
+.kb-plain-code .hljs-title.function_,
+.kb-plain-code .hljs-function .hljs-title{
+  color: var(--code-syn-func) !important;
+}
+.kb-plain-code .hljs-type,
+.kb-plain-code .hljs-class .hljs-title,
+.kb-plain-code .hljs-built_in,
+.kb-plain-code .hljs-params{
+  color: var(--code-syn-type) !important;
+}
+.kb-plain-code .hljs-variable,
+.kb-plain-code .hljs-symbol,
+.kb-plain-code .hljs-bullet{
+  color: var(--code-syn-literal) !important;
+}
+.kb-plain-code .hljs-operator,
+.kb-plain-code .hljs-punctuation{
+  color: var(--code-syn-operator) !important;
+}
+.kb-plain-code .kb-syn-comment{ color: var(--code-syn-comment) !important; font-style: italic; }
+.kb-plain-code .kb-syn-keyword{ color: var(--code-syn-keyword) !important; }
+.kb-plain-code .kb-syn-string{ color: var(--code-syn-string) !important; }
+.kb-plain-code .kb-syn-number{ color: var(--code-syn-number) !important; }
+.kb-plain-code .kb-syn-func{ color: var(--code-syn-func) !important; }
+.kb-plain-code .kb-syn-type{ color: var(--code-syn-type) !important; }
+.kb-plain-code .kb-syn-literal{ color: var(--code-syn-literal) !important; }
+.kb-plain-code .kb-syn-operator{ color: var(--code-syn-operator) !important; }
 div[data-testid="stCodeBlock"],
 div[data-testid="stCode"],
 .stCodeBlock{
@@ -1383,8 +1456,30 @@ div[data-testid="stCode"] *::after,
   border-radius: 16px;
   padding: 10px 14px;
   width: fit-content;
-  max-width: min(820px, 88%);
+  max-width: min(900px, 94%);
+  white-space: pre-wrap;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+  margin-left: 0;
+}
+.msg-user-wrap{
+  display: flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  gap: 0.42rem;
+  width: fit-content;
+  max-width: min(900px, 94%);
   margin-left: auto;
+}
+.msg-user-wrap .msg-user{
+  margin-left: 0 !important;
+}
+.msg-user-wrap .msg-meta-user{
+  margin: 0.14rem 0 0 0;
+  text-align: right;
+  white-space: nowrap;
+  line-height: 1.2;
+  font-weight: 560;
 }
 .msg-ai{ background: transparent; border: none; max-width: min(900px, 94%); }
 .msg-ai-stream{
@@ -1543,18 +1638,70 @@ body.kb-resizing .kb-input-dock *{
   padding: 0 !important;
 }
 
-.kb-copybar{ display: flex; gap: 10px; align-items: center; margin: 6px 0 10px 0; }
+.kb-copybar{
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: nowrap;
+  margin: 6px 0 10px 0;
+}
+.kb-ai-inline-logo{
+  height: 32px;
+  width: auto;
+  max-width: 88px;
+  object-fit: contain;
+  display: inline-block;
+  flex: 0 0 auto;
+}
+.kb-ai-livebar{
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.12rem 0 0.42rem 0;
+}
+.kb-ai-live-logo{
+  height: 22px;
+  width: auto;
+  max-width: 60px;
+  object-fit: contain;
+  display: inline-block;
+}
+.kb-ai-live-pill{
+  display: inline-flex;
+  align-items: center;
+  padding: 0.14rem 0.52rem;
+  border-radius: 999px;
+  border: 1px solid var(--blue-line);
+  background: var(--blue-weak);
+  color: var(--text-main) !important;
+  font-size: 0.76rem;
+  font-weight: 650;
+}
+.kb-ai-live-stage{
+  color: var(--text-soft) !important;
+  font-size: 0.82rem;
+}
+.kb-ai-live-dots{
+  margin: 0.02rem 0 0.46rem 0.08rem;
+  color: var(--muted) !important;
+  font-size: 0.88rem;
+  letter-spacing: 0.28em;
+  user-select: none;
+}
 .kb-copybtn{
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 6px 10px;
+  height: 32px;
+  min-height: 32px;
+  padding: 0 10px;
   border-radius: 10px;
   border: 1px solid var(--copy-btn-border);
   background: var(--copy-btn-bg);
   color: var(--copy-btn-text);
   font-weight: 600;
   font-size: 12px;
+  white-space: nowrap;
   cursor: pointer;
 }
 .kb-copybtn:hover{ background: var(--btn-hover); border-color: var(--blue-line); }
@@ -1574,9 +1721,9 @@ body.kb-resizing .kb-input-dock *{
   z-index: 2;
 }
 .kb-codecopy:hover{ background: var(--btn-hover); border-color: var(--blue-line); }
-div[data-testid="stCodeBlock"] .kb-codecopy,
-div[data-testid="stCode"] .kb-codecopy,
-.stCodeBlock .kb-codecopy{
+div[data-testid="stCodeBlock"]:not([data-kb-normalized="1"]) .kb-codecopy,
+div[data-testid="stCode"]:not([data-kb-normalized="1"]) .kb-codecopy,
+.stCodeBlock:not([data-kb-normalized="1"]) .kb-codecopy{
   display: none !important;
 }
 .kb-toast{
@@ -1763,6 +1910,44 @@ def _sidebar_logo_data_uri(path: Path) -> str | None:
         return None
 
 
+def _resolve_ai_inline_logo_data_uri() -> str | None:
+    cache_key = "_kb_ai_inline_logo_data_uri"
+    miss_key = "__MISS__"
+    cached = st.session_state.get(cache_key, None)
+    if cached == miss_key:
+        return None
+    if isinstance(cached, str) and cached.startswith("data:"):
+        return cached
+
+    base = Path(__file__).resolve().parent
+    env_logo = (os.environ.get("KB_INLINE_AI_LOGO") or "").strip().strip("'\"")
+    candidates: list[Path] = []
+    if env_logo:
+        p = Path(env_logo).expanduser()
+        if not p.is_absolute():
+            candidates.append((base / p).resolve())
+        candidates.append(p.resolve())
+    candidates.extend(
+        [
+            base / "assets" / "pi_logo.png",
+            base / "pi_logo.png",
+            base / "assets" / "team_logo.png",
+        ]
+    )
+    for p in candidates:
+        try:
+            if p.exists() and p.is_file():
+                uri = _sidebar_logo_data_uri(p)
+                if uri:
+                    st.session_state[cache_key] = uri
+                    return uri
+        except Exception:
+            continue
+
+    st.session_state[cache_key] = miss_key
+    return None
+
+
 def _render_app_title() -> None:
     title = str(S.get("title") or "").strip()
     if not title:
@@ -1894,8 +2079,11 @@ def _inject_copy_js() -> None:
         r"""
 <script>
 (function () {
-  const root = window.parent.document;
+  const host = window.parent || window;
+  const root = host.document || document;
   const TOAST_ID = "kb_toast";
+  const HLJS_KEY = "__kbHljsReady";
+  const HLJS_LOADING_KEY = "__kbHljsLoading";
 
   function ensureToast() {
     let t = root.getElementById(TOAST_ID);
@@ -1915,6 +2103,45 @@ def _inject_copy_js() -> None:
     t.classList.add("show");
     clearTimeout(t._kbTimer);
     t._kbTimer = setTimeout(() => t.classList.remove("show"), 900);
+  }
+
+  function ensureHighlightJs() {
+    try {
+      if (host[HLJS_KEY] && host.hljs && typeof host.hljs.highlightElement === "function") {
+        return Promise.resolve(host.hljs);
+      }
+      if (host[HLJS_LOADING_KEY]) {
+        return host[HLJS_LOADING_KEY];
+      }
+      host[HLJS_LOADING_KEY] = new Promise((resolve, reject) => {
+        const existing = root.querySelector('script[data-kb-hljs="1"]');
+        if (existing && host.hljs && typeof host.hljs.highlightElement === "function") {
+          host[HLJS_KEY] = true;
+          resolve(host.hljs);
+          return;
+        }
+        const script = existing || root.createElement("script");
+        if (!existing) {
+          script.src = "https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/common.min.js";
+          script.async = true;
+          script.defer = true;
+          script.dataset.kbHljs = "1";
+          (root.head || root.body || root.documentElement).appendChild(script);
+        }
+        script.addEventListener("load", () => {
+          if (host.hljs && typeof host.hljs.highlightElement === "function") {
+            host[HLJS_KEY] = true;
+            resolve(host.hljs);
+          } else {
+            reject(new Error("hljs unavailable"));
+          }
+        }, { once: true });
+        script.addEventListener("error", () => reject(new Error("hljs load failed")), { once: true });
+      }).catch(() => null);
+      return host[HLJS_LOADING_KEY];
+    } catch (e) {
+      return Promise.resolve(null);
+    }
   }
 
   async function copyText(text) {
@@ -1973,18 +2200,100 @@ def _inject_copy_js() -> None:
         }
         if (!codeNode) continue;
         const txt = String(codeNode.innerText || codeNode.textContent || "");
+        const codeClass = String(codeNode.className || "");
         if (!txt.trim()) continue;
         try {
           block.innerHTML = "";
           const pre = root.createElement("pre");
           pre.className = "kb-plain-code";
           const code = root.createElement("code");
+          if (codeClass) code.className = codeClass;
           code.textContent = txt.replace(/\r\n/g, "\n");
           pre.appendChild(code);
           block.appendChild(pre);
           block.dataset.kbNormalized = "1";
         } catch (e) {}
       }
+    }
+
+    function escapeHtml(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    function inferLang(raw, cls) {
+      const c = String(cls || "").toLowerCase();
+      const t = String(raw || "");
+      if (c.includes("python") || c.includes("language-py") || c.includes("lang-py")) return "python";
+      if (c.includes("javascript") || c.includes("language-js") || c.includes("lang-js") || c.includes("typescript")) return "javascript";
+      if (/\b(def|import|from|return|lambda|None|True|False|async|await)\b/.test(t)) return "python";
+      if (/\b(function|const|let|var|return|=>|async|await)\b/.test(t)) return "javascript";
+      return "plain";
+    }
+
+    function simpleHighlight(raw, lang) {
+      let s = escapeHtml(String(raw || "").replace(/\r\n/g, "\n"));
+      const stash = [];
+      function keep(regex, cls) {
+        s = s.replace(regex, (m) => {
+          const id = stash.length;
+          stash.push(`<span class="${cls}">${m}</span>`);
+          return `@@KBH${id}@@`;
+        });
+      }
+
+      keep(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')/g, "kb-syn-string");
+      keep(/(#[^\n]*|\/\/[^\n]*)/g, "kb-syn-comment");
+
+      let kw = [];
+      if (lang === "python") {
+        kw = ["and","as","assert","async","await","break","class","continue","def","del","elif","else","except","False","finally","for","from","global","if","import","in","is","lambda","None","nonlocal","not","or","pass","raise","return","True","try","while","with","yield"];
+      } else if (lang === "javascript") {
+        kw = ["await","break","case","catch","class","const","continue","debugger","default","delete","do","else","export","extends","finally","for","function","if","import","in","instanceof","let","new","return","super","switch","this","throw","try","typeof","var","void","while","with","yield"];
+      }
+      if (kw.length) {
+        const kwRe = new RegExp("\\\\b(" + kw.join("|") + ")\\\\b", "g");
+        s = s.replace(kwRe, '<span class="kb-syn-keyword">$1</span>');
+      }
+      s = s.replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="kb-syn-number">$1</span>');
+      s = s.replace(/\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()/g, '<span class="kb-syn-func">$1</span>');
+
+      s = s.replace(/@@KBH(\d+)@@/g, (_, idx) => stash[Number(idx)] || "");
+      return s;
+    }
+
+    function applyTyporaHighlight() {
+      const codes = root.querySelectorAll("pre.kb-plain-code > code, .msg-ai pre code, .stMarkdown pre code");
+      ensureHighlightJs().then((hljs) => {
+        for (const code of codes) {
+          if (!code) continue;
+          const raw = String(code.textContent || "");
+          if (!raw.trim()) continue;
+          const lang = inferLang(raw, code.className || "");
+          const sig = String(raw.length) + ":" + raw.slice(0, 120) + ":" + lang;
+          if (code.dataset.kbHlSig === sig) continue;
+          code.dataset.kbHlSig = sig;
+          try {
+            code.removeAttribute("data-highlighted");
+            code.classList.remove("hljs");
+            code.textContent = raw;
+            if (hljs && typeof hljs.highlightElement === "function") {
+              hljs.highlightElement(code);
+              code.classList.add("hljs");
+            } else {
+              code.innerHTML = simpleHighlight(raw, lang);
+              code.classList.add("hljs");
+            }
+          } catch (e) {
+            try {
+              code.innerHTML = simpleHighlight(raw, lang);
+              code.classList.add("hljs");
+            } catch (e2) {}
+          }
+        }
+      });
     }
 
     function hasNativeCopy(pre) {
@@ -2006,6 +2315,7 @@ def _inject_copy_js() -> None:
     }
 
     normalizeNativeCodeBlocks();
+    applyTyporaHighlight();
 
     const pres = root.querySelectorAll("pre");
     for (const pre of pres) {
@@ -2242,6 +2552,12 @@ def _render_answer_copy_bar(answer_md: str, *, key_ns: str) -> None:
     txt = _md_to_plain_text(md)
     md_id = f"{key_ns}_md"
     txt_id = f"{key_ns}_txt"
+    ai_logo_uri = _resolve_ai_inline_logo_data_uri()
+    logo_html = (
+        f'<img class="kb-ai-inline-logo" src="{html.escape(ai_logo_uri)}" alt="AI"/>'
+        if ai_logo_uri
+        else ""
+    )
 
     # Hidden payloads (large text lives here, buttons reference them by id).
     st.markdown(
@@ -2249,8 +2565,30 @@ def _render_answer_copy_bar(answer_md: str, *, key_ns: str) -> None:
 <textarea id="{html.escape(md_id)}" style="display:none">{html.escape(md)}</textarea>
 <textarea id="{html.escape(txt_id)}" style="display:none">{html.escape(txt)}</textarea>
 <div class="kb-copybar">
+  {logo_html}
   <button class="kb-copybtn" type="button" data-target="{html.escape(txt_id)}">复制文本</button>
   <button class="kb-copybtn" type="button" data-target="{html.escape(md_id)}">复制 Markdown</button>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_ai_live_header(stage: str = "") -> None:
+    logo_uri = _resolve_ai_inline_logo_data_uri()
+    safe_stage = html.escape((stage or "").strip())
+    logo_html = (
+        f'<img class="kb-ai-live-logo" src="{html.escape(logo_uri)}" alt="AI"/>'
+        if logo_uri
+        else '<span class="msg-meta">AI</span>'
+    )
+    stage_html = f'<span class="kb-ai-live-stage">阶段：{safe_stage}</span>' if safe_stage else ""
+    st.markdown(
+        f"""
+<div class="kb-ai-livebar">
+  {logo_html}
+  <span class="kb-ai-live-pill">生成中</span>
+  {stage_html}
 </div>
         """,
         unsafe_allow_html=True,
@@ -4725,9 +5063,11 @@ def _page_chat(
                 msg_id = 0
 
             if role == "user":
-                st.markdown("<div class='msg-meta'>你</div>", unsafe_allow_html=True)
                 safe = html.escape(content).replace("\n", "<br/>")
-                st.markdown(f"<div class='msg-user'>{safe}</div>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='msg-user-wrap'><div class='msg-user'>{safe}</div><div class='msg-meta msg-meta-user'>你</div></div>",
+                    unsafe_allow_html=True,
+                )
                 last_user_for_refs = content
                 if msg_id > 0:
                     last_user_msg_id = msg_id
@@ -4740,7 +5080,7 @@ def _page_chat(
                         pending = str(t0.get("status") or "") == "running"
                         stage = str(t0.get("stage") or "-")
                         if pending:
-                            st.markdown("<div class='msg-meta'>AI（生成中）</div>", unsafe_allow_html=True)
+                            _render_ai_live_header(stage=stage)
                             partial = str(t0.get("partial") or "").strip()
                             notice, body = _split_kb_miss_notice(partial)
                             if notice:
@@ -4748,12 +5088,10 @@ def _page_chat(
                             if (body or "").strip():
                                 st.markdown(_normalize_math_markdown(body))
                             else:
-                                st.caption("（生成中…）")
-                            st.caption(f"阶段：{stage}")
+                                st.markdown("<div class='kb-ai-live-dots'>...</div>", unsafe_allow_html=True)
                         else:
                             ans0 = str(t0.get("answer") or "").strip()
                             if ans0:
-                                st.markdown("<div class='msg-meta'>AI</div>", unsafe_allow_html=True)
                                 _render_answer_copy_bar(ans0, key_ns=f"copy_{idx}_done")
                                 notice, body = _split_kb_miss_notice(ans0)
                                 if notice:
@@ -4767,7 +5105,6 @@ def _page_chat(
                         st.markdown("<div class='msg-meta'>AI（处理中）</div>", unsafe_allow_html=True)
                         st.caption("处理中…")
                 else:
-                    st.markdown("<div class='msg-meta'>AI</div>", unsafe_allow_html=True)
                     msg_key = hashlib.md5((st.session_state.get("conv_id", "") + "|" + str(idx)).encode("utf-8", "ignore")).hexdigest()[:10]
                     _render_answer_copy_bar(content, key_ns=f"copy_{msg_key}")
                     notice, body = _split_kb_miss_notice(content or "")
