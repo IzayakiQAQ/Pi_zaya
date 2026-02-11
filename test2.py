@@ -249,6 +249,7 @@ def _bbox_height(bbox: Iterable[float]) -> float:
     _, y0, _, y1 = bbox
     return float(y1) - float(y0)
 
+
 def _rect_area(rect) -> float:
     try:
         return float(rect.get_area())
@@ -257,6 +258,17 @@ def _rect_area(rect) -> float:
             return max(0.0, float(rect.width) * float(rect.height))
         except Exception:
             return 0.0
+
+
+def _rect_intersection_area(a, b) -> float:
+    """Intersection area without mutating either input rect."""
+    if fitz is None:
+        return 0.0
+    try:
+        inter = fitz.Rect(a) & fitz.Rect(b)
+    except Exception:
+        return 0.0
+    return _rect_area(inter)
 
 
 @dataclass(frozen=True)
@@ -285,8 +297,9 @@ class ConvertConfig:
     llm_render_page: bool = False
     llm_classify_only_if_needed: bool = True
     classify_batch_size: int = 40
-    image_scale: float = 2.0
+    image_scale: float = 2.6
     image_alpha: bool = False
+    detect_tables: bool = True
     eq_image_fallback: bool = False
     global_noise_scan: bool = True
     llm_repair: bool = True
@@ -302,6 +315,7 @@ class TextBlock:
     insert_image: Optional[str] = None
     is_code: bool = False
     is_table: bool = False
+    table_markdown: Optional[str] = None
     is_math: bool = False
     heading_level: Optional[int] = None
 
@@ -787,6 +801,128 @@ def _collect_visual_rects(page) -> list["fitz.Rect"]:
     return uniq
 
 
+def _escape_md_table_cell(value: str) -> str:
+    cell = _normalize_text(value or "")
+    if not cell:
+        return ""
+    cell = cell.replace("\r", "\n")
+    cell = re.sub(r"\s*\n\s*", "<br>", cell)
+    cell = cell.replace("|", r"\|")
+    return cell.strip()
+
+
+def _table_rows_to_markdown(rows_raw) -> Optional[str]:
+    if not rows_raw or not isinstance(rows_raw, list):
+        return None
+
+    rows: list[list[str]] = []
+    for row in rows_raw:
+        if not isinstance(row, (list, tuple)):
+            continue
+        cells = [_escape_md_table_cell("" if c is None else str(c)) for c in row]
+        rows.append(cells)
+
+    # Drop empty rows.
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if len(rows) < 2:
+        return None
+
+    width = max(len(r) for r in rows)
+    if width < 2:
+        return None
+    rows = [r + [""] * (width - len(r)) for r in rows]
+
+    # Drop columns that are empty across all rows.
+    keep_cols = [i for i in range(width) if any(rows[r][i].strip() for r in range(len(rows)))]
+    if len(keep_cols) < 2:
+        return None
+    rows = [[r[i] for i in keep_cols] for r in rows]
+    width = len(rows[0])
+
+    # Some detectors prepend an almost-empty row; skip it if it looks like noise.
+    if len(rows) >= 3:
+        first_non_empty = sum(1 for c in rows[0] if c.strip())
+        second_non_empty = sum(1 for c in rows[1] if c.strip())
+        if first_non_empty <= 1 and second_non_empty >= 2:
+            rows = rows[1:]
+
+    if len(rows) < 2:
+        return None
+
+    header = rows[0]
+    if not any(c.strip() for c in header):
+        header = [f"col_{i + 1}" for i in range(width)]
+
+    md_lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * width) + " |",
+    ]
+    for row in rows[1:]:
+        md_lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(md_lines)
+
+
+def _extract_tables_by_layout(page) -> list[tuple["fitz.Rect", str]]:
+    """
+    Prefer PyMuPDF's structural table detector to avoid treating tables as plain paragraphs.
+    """
+    if fitz is None or (not hasattr(page, "find_tables")):
+        return []
+
+    page_w = float(page.rect.width)
+    page_h = float(page.rect.height)
+    page_area = max(1.0, page_w * page_h)
+
+    try:
+        table_finder = page.find_tables()
+    except Exception:
+        return []
+
+    tables = getattr(table_finder, "tables", table_finder)
+    if not tables:
+        return []
+
+    out: list[tuple[fitz.Rect, str]] = []
+    for tb in tables:
+        try:
+            rect = fitz.Rect(getattr(tb, "bbox", None))
+        except Exception:
+            continue
+        if _rect_area(rect) < page_area * 0.004:
+            continue
+        if float(rect.width) < page_w * 0.16 or float(rect.height) < page_h * 0.05:
+            continue
+
+        md = None
+        try:
+            md = _table_rows_to_markdown(tb.extract())
+        except Exception:
+            md = None
+        if not md:
+            try:
+                raw_clip = page.get_text("text", clip=rect)
+            except Exception:
+                raw_clip = ""
+            md = table_text_to_markdown(raw_clip) if raw_clip else None
+        if not md:
+            continue
+        out.append((rect, md))
+
+    # De-duplicate near-identical table rectangles.
+    uniq: list[tuple[fitz.Rect, str]] = []
+    for rect, md in sorted(out, key=lambda x: (x[0].y0, x[0].x0)):
+        dup = False
+        for r0, _ in uniq:
+            inter = _rect_intersection_area(rect, r0)
+            denom = max(1.0, min(_rect_area(rect), _rect_area(r0)))
+            if inter / denom >= 0.75:
+                dup = True
+                break
+        if not dup:
+            uniq.append((rect, md))
+    return uniq
+
+
 def _math_fragment_score(b: "TextBlock", *, body_size: float) -> int:
     """
     Score whether a math block is likely a fragment (limits, lone operators, etc.) that should be merged.
@@ -867,6 +1003,7 @@ def merge_adjacent_math_blocks(
                 insert_image=b.insert_image,
                 is_code=b.is_code,
                 is_table=b.is_table,
+                table_markdown=b.table_markdown,
                 is_math=True,
                 heading_level=b.heading_level,
             )
@@ -1142,6 +1279,7 @@ def extract_eqno_from_math_text(
                     insert_image=b.insert_image,
                     is_code=b.is_code,
                     is_table=b.is_table,
+                    table_markdown=b.table_markdown,
                     is_math=b.is_math,
                     heading_level=b.heading_level,
                 )
@@ -1318,8 +1456,7 @@ def extract_images_fallback(
     def is_covered(r: fitz.Rect) -> bool:
         ra = max(1.0, float(r.width) * float(r.height))
         for c in covered_rects or []:
-            inter = r.intersect(c)
-            ia = max(0.0, float(inter.width) * float(inter.height))
+            ia = _rect_intersection_area(r, c)
             if ia / ra >= 0.55:
                 return True
         return False
@@ -1445,6 +1582,7 @@ def extract_text_blocks(
     drop_frontmatter: bool = True,
     relax_small_text_filter: bool = False,
     preserve_body_linebreaks: bool = False,
+    detect_tables: bool = True,
 ) -> list[TextBlock]:
     d = page.get_text("dict")
     blocks: list[TextBlock] = []
@@ -1455,6 +1593,8 @@ def extract_text_blocks(
 
     img_infos = page.get_image_info() or []
     img_rects = [fitz.Rect(i["bbox"]) for i in img_infos if "bbox" in i]
+    table_regions = _extract_tables_by_layout(page) if detect_tables else []
+    table_rects = [r for r, _ in table_regions]
 
     for b in d.get("blocks", []):
         if "lines" not in b:
@@ -1487,6 +1627,15 @@ def extract_text_blocks(
         if not probe:
             continue
         joined_probe = _normalize_text(" ".join(probe))
+        is_table_caption = bool(re.match(r"^\s*Table\s+(?:\d+|[IVXLC]+)\b", joined_probe, re.IGNORECASE))
+
+        # Table detector already extracted this region as structured rows.
+        # Skip overlapping text blocks to avoid duplicate "table as paragraph" output.
+        if table_rects and (not is_table_caption):
+            block_area = max(1.0, _rect_area(rect))
+            inter_table = max((_rect_intersection_area(rect, tr) for tr in table_rects), default=0.0)
+            if inter_table / block_area >= 0.62:
+                continue
 
         # Header/footer band filter, but keep real structural content.
         if rect.y1 < header_y or rect.y0 > footer_y:
@@ -1501,7 +1650,7 @@ def extract_text_blocks(
         # but captions may also intersect (depending on how the PDF encodes bbox). Keep captions and equation numbers.
         if img_rects:
             block_area = max(1.0, _rect_area(rect))
-            inter = max((_rect_area(rect.intersect(r)) for r in img_rects), default=0.0)
+            inter = max((_rect_intersection_area(rect, r) for r in img_rects), default=0.0)
             inside_ratio = inter / block_area
             if inside_ratio > 0.78:
                 if not re.match(r"^\s*(?:Fig\.|FIG\.|Figure|FIGURE)\s*[0-9]+", joined_probe, re.IGNORECASE) and not re.fullmatch(
@@ -1556,17 +1705,72 @@ def extract_text_blocks(
             )
         )
 
+    for table_rect, table_md in table_regions:
+        blocks.append(
+            TextBlock(
+                bbox=(float(table_rect.x0), float(table_rect.y0), float(table_rect.x1), float(table_rect.y1)),
+                text=table_md,
+                max_font_size=body_size,
+                is_bold=False,
+                is_table=True,
+                table_markdown=table_md,
+            )
+        )
+
     return blocks
+
+
+def _detect_column_split_x(blocks: list[TextBlock], page_width: float) -> Optional[float]:
+    """
+    Detect the x-position separating left/right columns.
+    Returns None for likely single-column layouts.
+    """
+    if not blocks:
+        return None
+
+    candidates = [
+        (float(b.bbox[0]) + float(b.bbox[2])) / 2.0
+        for b in blocks
+        if _bbox_width(b.bbox) < page_width * 0.62
+    ]
+    if len(candidates) < 4:
+        return None
+    centers = sorted(candidates)
+
+    best_gap = 0.0
+    best_mid = None
+    lo = page_width * 0.22
+    hi = page_width * 0.78
+    for i in range(len(centers) - 1):
+        a, b = centers[i], centers[i + 1]
+        mid = (a + b) / 2.0
+        if mid < lo or mid > hi:
+            continue
+        gap = float(b - a)
+        if gap > best_gap:
+            best_gap = gap
+            best_mid = mid
+
+    if best_mid is None or best_gap < page_width * 0.08:
+        return None
+
+    left_n = sum(1 for c in centers if c < best_mid)
+    right_n = len(centers) - left_n
+    if left_n < 2 or right_n < 2:
+        return None
+    return float(best_mid)
 
 
 def sort_blocks_reading_order(blocks: list[TextBlock], page_width: float) -> list[TextBlock]:
     if not blocks:
         return []
 
-    mid = page_width / 2.0
-    spanning_threshold = page_width * 0.6
-    col_split = mid - 10.0
+    col_split = _detect_column_split_x(blocks, page_width=page_width)
+    if col_split is None:
+        return sorted(blocks, key=lambda b: (b.bbox[1], b.bbox[0]))
 
+    spanning_threshold = page_width * 0.62
+    cross_margin = max(8.0, page_width * 0.015)
     by_y = sorted(blocks, key=lambda b: (b.bbox[1], b.bbox[0]))
 
     out: list[TextBlock] = []
@@ -1576,14 +1780,18 @@ def sort_blocks_reading_order(blocks: list[TextBlock], page_width: float) -> lis
         nonlocal segment
         if not segment:
             return
-        left = [b for b in segment if b.bbox[0] < col_split]
-        right = [b for b in segment if b.bbox[0] >= col_split]
+        left = [b for b in segment if ((float(b.bbox[0]) + float(b.bbox[2])) / 2.0) < col_split]
+        right = [b for b in segment if ((float(b.bbox[0]) + float(b.bbox[2])) / 2.0) >= col_split]
+        left.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
+        right.sort(key=lambda b: (b.bbox[1], b.bbox[0]))
         out.extend(left)
         out.extend(right)
         segment = []
 
     for b in by_y:
-        if _bbox_width(b.bbox) >= spanning_threshold:
+        x0, _, x1, _ = b.bbox
+        crosses_split = float(x0) < (col_split - cross_margin) and float(x1) > (col_split + cross_margin)
+        if _bbox_width(b.bbox) >= spanning_threshold or crosses_split:
             flush_segment()
             out.append(b)
         else:
@@ -3450,7 +3658,9 @@ TEXT:
                 continue
 
             if b.is_table:
-                table_md = table_text_to_markdown(b.text)
+                table_md = (b.table_markdown or "").strip() or None
+                if not table_md:
+                    table_md = table_text_to_markdown(b.text)
                 if not table_md:
                     # Some publishers encode tables in math/array form or flatten columns badly.
                     table_md = self._call_llm_repair_table(b.text, page_number=page_number, block_index=bi)
@@ -3831,6 +4041,7 @@ INPUT JSON:
                     page_index=page_index,
                     relax_small_text_filter=bool(in_references),
                     preserve_body_linebreaks=bool(in_references),
+                    detect_tables=bool(self.cfg.detect_tables),
                 )
                 blocks = sort_blocks_reading_order(blocks, page_width=float(page.rect.width))
 
@@ -3921,6 +4132,7 @@ INPUT JSON:
                                 insert_image=b.insert_image,
                                 is_code=is_code,
                                 is_table=is_table,
+                                table_markdown=(b.table_markdown if is_table else None),
                                 is_math=is_math,
                                 heading_level=hl,
                             )
@@ -3954,6 +4166,7 @@ INPUT JSON:
                                     insert_image=b.insert_image,
                                     is_code=b.is_code,
                                     is_table=b.is_table,
+                                    table_markdown=b.table_markdown,
                                     is_math=b.is_math,
                                     heading_level=lvl,
                                 )
@@ -4140,8 +4353,9 @@ def _parse_args(argv: Optional[list[str]] = None) -> ConvertConfig:
     ap.add_argument("--no-llm-render-page", action="store_true", help="Disable page-level LLM rendering")
     ap.add_argument("--classify-batch-size", type=int, default=40, help="LLM classify blocks batch size (higher=fewer calls)")
     ap.add_argument("--classify-always", action="store_true", help="Always classify every page with LLM (slower)")
-    ap.add_argument("--image-scale", type=float, default=2.0, help="Image render scale for figure crops (lower=faster)")
+    ap.add_argument("--image-scale", type=float, default=2.6, help="Image render scale for figure/equation crops (lower=faster)")
     ap.add_argument("--image-alpha", action="store_true", help="Render images with alpha channel (slower)")
+    ap.add_argument("--no-table-detect", action="store_true", help="Disable structural table detection from PDF layout")
     ap.add_argument(
         "--eq-image-fallback",
         action="store_true",
@@ -4198,6 +4412,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> ConvertConfig:
         classify_batch_size=int(args.classify_batch_size),
         image_scale=float(args.image_scale),
         image_alpha=bool(args.image_alpha),
+        detect_tables=(not bool(args.no_table_detect)),
         eq_image_fallback=bool(args.eq_image_fallback),
         global_noise_scan=(not bool(args.no_global_noise_scan)),
         llm_repair=(not bool(args.no_llm_repair)),
