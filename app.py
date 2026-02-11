@@ -726,6 +726,8 @@ def _init_theme_css(theme_mode: str = "dark") -> None:
   --toast-border: rgba(148, 163, 184, 0.30);
   --toast-text: #ebf1f8;
   --hint-text: #d2d9e4;
+  --refs-title-text: #e7eaef;
+  --refs-body-text: #dbe4f0;
   --code-bg: #171d28;
   --code-border: #3d4658;
   --code-text: #e6edf3;
@@ -782,6 +784,8 @@ def _init_theme_css(theme_mode: str = "dark") -> None:
   --toast-border: rgba(49, 51, 63, 0.16);
   --toast-text: rgba(31, 42, 55, 0.88);
   --hint-text: rgba(75, 85, 99, 0.62);
+  --refs-title-text: #1f2329;
+  --refs-body-text: #4b5563;
   --code-bg: #f5f7fb;
   --code-border: rgba(31, 35, 41, 0.16);
   --code-text: #1f2329;
@@ -1305,73 +1309,29 @@ div[data-testid="stCode"] span,
 .msg-refs details[data-testid="stExpander"] summary *,
 .msg-refs details[data-testid="stExpander"] summary p,
 .msg-refs details[data-testid="stExpander"] summary span{
-  color: var(--text-main) !important;
+  color: var(--refs-title-text) !important;
   opacity: 1 !important;
-  -webkit-text-fill-color: var(--text-main) !important;
+  -webkit-text-fill-color: var(--refs-title-text) !important;
 }
 .msg-refs [data-testid="stMarkdownContainer"] *,
 .msg-refs .refbox,
 .msg-refs .refbox *{
-  color: var(--text-soft) !important;
+  color: var(--refs-body-text) !important;
   opacity: 1 !important;
+  -webkit-text-fill-color: var(--refs-body-text) !important;
 }
 .msg-refs details[data-testid="stExpander"] summary [data-testid="stMarkdownContainer"] *,
 .msg-refs details[data-testid="stExpander"] summary p,
 .msg-refs details[data-testid="stExpander"] summary span,
 .msg-refs details[data-testid="stExpander"] summary div{
-  color: var(--text-main) !important;
-  -webkit-text-fill-color: var(--text-main) !important;
+  color: var(--refs-title-text) !important;
+  -webkit-text-fill-color: var(--refs-title-text) !important;
   opacity: 1 !important;
 }
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary [data-testid="stMarkdownContainer"] *,
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary p,
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary span,
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary div,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary [data-testid="stMarkdownContainer"] *,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary p,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary span,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary div{
-  color: #e7eaef !important;
-  -webkit-text-fill-color: #e7eaef !important;
-  opacity: 1 !important;
-}
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary,
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary *,
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary svg,
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary path,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary *,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary svg,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] summary path{
-  color: #e7eaef !important;
-  -webkit-text-fill-color: #e7eaef !important;
-  fill: #e7eaef !important;
-  stroke: #e7eaef !important;
-}
-html[data-theme="dark"] .msg-refs details[data-testid="stExpander"] [data-testid="stMarkdownContainer"] *,
-html[data-theme="dark"] .msg-refs .refbox,
-html[data-theme="dark"] .msg-refs .refbox *,
-body[data-theme="dark"] .msg-refs details[data-testid="stExpander"] [data-testid="stMarkdownContainer"] *,
-body[data-theme="dark"] .msg-refs .refbox,
-body[data-theme="dark"] .msg-refs .refbox *{
-  color: #dbe4f0 !important;
-  -webkit-text-fill-color: #dbe4f0 !important;
-}
-html[data-theme="light"] .msg-refs details[data-testid="stExpander"] summary,
-html[data-theme="light"] .msg-refs details[data-testid="stExpander"] summary *,
-body[data-theme="light"] .msg-refs details[data-testid="stExpander"] summary,
-body[data-theme="light"] .msg-refs details[data-testid="stExpander"] summary *{
-  color: #1f2329 !important;
-  -webkit-text-fill-color: #1f2329 !important;
-}
-html[data-theme="light"] .msg-refs details[data-testid="stExpander"] [data-testid="stMarkdownContainer"] *,
-html[data-theme="light"] .msg-refs .refbox,
-html[data-theme="light"] .msg-refs .refbox *,
-body[data-theme="light"] .msg-refs details[data-testid="stExpander"] [data-testid="stMarkdownContainer"] *,
-body[data-theme="light"] .msg-refs .refbox,
-body[data-theme="light"] .msg-refs .refbox *{
-  color: #4b5563 !important;
-  -webkit-text-fill-color: #4b5563 !important;
+.msg-refs details[data-testid="stExpander"] summary svg,
+.msg-refs details[data-testid="stExpander"] summary path{
+  fill: var(--refs-title-text) !important;
+  stroke: var(--refs-title-text) !important;
 }
 
 .snipbox{
@@ -1638,62 +1598,9 @@ body[data-theme="dark"] section[data-testid="stSidebar"] div[data-testid="stSlid
   const host = window.parent || window;
   const doc = host.document || document;
   const mode = "__MODE__";
-  const FIX_TIMER_NS = "__kbSidebarSliderTextFixTimer";
-  try {
-    if (host[FIX_TIMER_NS]) {
-      host.clearInterval(host[FIX_TIMER_NS]);
-      host[FIX_TIMER_NS] = 0;
-    }
-  } catch (e) {}
   try {
     doc.documentElement.setAttribute("data-theme", mode);
     if (doc.body) doc.body.setAttribute("data-theme", mode);
-  } catch (e) {}
-
-  function paintNode(node, color) {
-    if (!node || !node.style) return;
-    try {
-      node.style.setProperty("color", color, "important");
-      node.style.setProperty("-webkit-text-fill-color", color, "important");
-      node.style.setProperty("fill", color, "important");
-      node.style.setProperty("stroke", color, "important");
-      node.style.setProperty("opacity", "1", "important");
-    } catch (e) {}
-  }
-
-  function applySidebarSliderTextFix() {
-    try {
-      if (mode !== "dark") return;
-      const rootStyle = host.getComputedStyle(doc.documentElement);
-      const soft = (rootStyle.getPropertyValue("--sidebar-soft-text") || "#d5deea").trim();
-      const accent = (rootStyle.getPropertyValue("--accent") || "#4daafc").trim();
-      const sidebar = doc.querySelector('section[data-testid="stSidebar"]');
-      if (!sidebar) return;
-      const sliders = sidebar.querySelectorAll('div[data-testid="stSlider"]');
-      for (const slider of sliders) {
-        paintNode(slider, soft);
-        const nodes = slider.querySelectorAll("*");
-        for (const n of nodes) {
-          const tid = String((n.getAttribute && n.getAttribute("data-testid")) || "");
-          const t = String(n.textContent || "").trim();
-          const isNumeric = /^-?\d+(\.\d+)?$/.test(t);
-          const isTick =
-            tid.toLowerCase().includes("tick") ||
-            tid.toLowerCase().includes("min") ||
-            tid.toLowerCase().includes("max");
-          if (tid.toLowerCase().includes("thumbvalue")) {
-            paintNode(n, accent);
-          } else if (isTick || isNumeric) {
-            paintNode(n, soft);
-          }
-        }
-      }
-    } catch (e) {}
-  }
-
-  applySidebarSliderTextFix();
-  try {
-    host[FIX_TIMER_NS] = host.setInterval(applySidebarSliderTextFix, 220);
   } catch (e) {}
 })();
 </script>
@@ -2039,12 +1946,11 @@ def _inject_runtime_ui_fixes(theme_mode: str) -> None:
 (function () {{
   const host = window.parent || window;
   const doc = host.document || document;
-  const KEY = "__kbSliderTickRuntimeFixV1";
+  const KEY = "__kbUiRuntimeFixV2";
   const mode = "{mode}";
   try {{
-    if (host[KEY]) {{
-      host.clearInterval(host[KEY]);
-      host[KEY] = 0;
+    if (host[KEY] && typeof host[KEY].destroy === "function") {{
+      host[KEY].destroy();
     }}
   }} catch (e) {{}}
 
@@ -2060,28 +1966,26 @@ def _inject_runtime_ui_fixes(theme_mode: str) -> None:
     }} catch (e) {{}}
   }}
 
-  function apply() {{
+  function clearInlineThemeForRefs() {{
     try {{
-      const soft = mode === "dark" ? "#dbe4f0" : "#5a6472";
-      const accent = mode === "dark" ? "#4daafc" : "#0f6cbd";
-      const mainText = mode === "dark" ? "#e7eaef" : "#1f2329";
-      const refsNodes = doc.querySelectorAll(
-        '.msg-refs details[data-testid="stExpander"] summary, .msg-refs details[data-testid="stExpander"] summary *, .msg-refs [data-testid="stMarkdownContainer"], .msg-refs [data-testid="stMarkdownContainer"] *'
-      );
-      for (const n of refsNodes) {{
+      const nodes = doc.querySelectorAll(".msg-refs, .msg-refs *");
+      for (const n of nodes) {{
         if (!n || !n.style) continue;
-        try {{
-          n.style.removeProperty("color");
-          n.style.removeProperty("-webkit-text-fill-color");
-          n.style.removeProperty("fill");
-          n.style.removeProperty("stroke");
-          n.style.removeProperty("opacity");
-          n.style.removeProperty("filter");
-        }} catch (e) {{}}
+        n.style.removeProperty("color");
+        n.style.removeProperty("-webkit-text-fill-color");
+        n.style.removeProperty("fill");
+        n.style.removeProperty("stroke");
+        n.style.removeProperty("opacity");
+        n.style.removeProperty("filter");
       }}
+    }} catch (e) {{}}
+  }}
 
-      const sidebars2 = doc.querySelectorAll('section[data-testid="stSidebar"]');
-      for (const sidebar of sidebars2) {{
+  function normalizeSidebarCloseIcon() {{
+    try {{
+      const mainText = mode === "dark" ? "#e7eaef" : "#1f2329";
+      const sidebars = doc.querySelectorAll('section[data-testid="stSidebar"]');
+      for (const sidebar of sidebars) {{
         const sbRect = sidebar.getBoundingClientRect ? sidebar.getBoundingClientRect() : null;
         const btns = sidebar.querySelectorAll("button");
         for (const b of btns) {{
@@ -2090,7 +1994,6 @@ def _inject_runtime_ui_fixes(theme_mode: str) -> None:
           const nearTopRight = !!(sbRect && rect && rect.top <= (sbRect.top + 90) && rect.left >= (sbRect.right - 100));
           const maybeClose = aria.includes("close") || aria.includes("collapse") || aria.includes("关闭") || nearTopRight;
           if (!maybeClose) continue;
-
           try {{
             b.style.setProperty("width", "34px", "important");
             b.style.setProperty("height", "34px", "important");
@@ -2103,7 +2006,6 @@ def _inject_runtime_ui_fixes(theme_mode: str) -> None:
             b.style.setProperty("align-items", "center", "important");
             b.style.setProperty("justify-content", "center", "important");
           }} catch (e) {{}}
-
           const svgs = b.querySelectorAll("svg");
           for (const s of svgs) {{
             try {{ s.style.setProperty("display", "none", "important"); }} catch (e) {{}}
@@ -2112,7 +2014,6 @@ def _inject_runtime_ui_fixes(theme_mode: str) -> None:
           for (const ic of icons) {{
             try {{ ic.style.setProperty("display", "none", "important"); }} catch (e) {{}}
           }}
-
           let glyph = b.querySelector(".kb-close-glyph");
           if (!glyph) {{
             glyph = doc.createElement("span");
@@ -2127,10 +2028,38 @@ def _inject_runtime_ui_fixes(theme_mode: str) -> None:
     }} catch (e) {{}}
   }}
 
-  apply();
-  try {{
-    host[KEY] = host.setInterval(apply, 420);
-  }} catch (e) {{}}
+  function applyNow() {{
+    clearInlineThemeForRefs();
+    normalizeSidebarCloseIcon();
+  }}
+
+  let raf = 0;
+  function schedule() {{
+    if (raf) return;
+    raf = host.requestAnimationFrame(function () {{
+      raf = 0;
+      applyNow();
+    }});
+  }}
+
+  let mo = null;
+  function observe() {{
+    if (typeof MutationObserver === "undefined") return;
+    try {{
+      mo = new MutationObserver(function () {{ schedule(); }});
+      mo.observe(doc.body, {{ childList: true, subtree: true, attributes: true }});
+    }} catch (e) {{}}
+  }}
+
+  function destroy() {{
+    try {{ if (mo) mo.disconnect(); }} catch (e) {{}}
+    try {{ if (raf) host.cancelAnimationFrame(raf); }} catch (e) {{}}
+  }}
+
+  host[KEY] = {{ destroy }};
+
+  schedule();
+  observe();
 }})();
 </script>
         """,
